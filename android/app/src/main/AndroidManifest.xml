@@ -1,32 +1,41 @@
 <!--
-  ~ FLauncher
-  ~ Copyright (C) 2021  Étienne Fesser
+  ~ Moonode Launcher
+  ~ Copyright (C) 2025 Moonode
   ~
-  ~ This program is free software: you can redistribute it and/or modify
-  ~ it under the terms of the GNU General Public License as published by
-  ~ the Free Software Foundation, either version 3 of the License, or
-  ~ (at your option) any later version.
-  ~
-  ~ This program is distributed in the hope that it will be useful,
-  ~ but WITHOUT ANY WARRANTY; without even the implied warranty of
-  ~ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  ~ GNU General Public License for more details.
-  ~
-  ~ You should have received a copy of the GNU General Public License
-  ~ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+  ~ Based on FLauncher by Étienne Fesser (GPL-3.0)
+  ~ Modified for Moonode TV integration
   -->
 
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="me.efesser.flauncher">
+    package="com.moonode.launcher">
 
+    <!-- TV Features -->
     <uses-feature
         android:name="android.hardware.touchscreen"
         android:required="false" />
     <uses-feature
         android:name="android.software.leanback"
         android:required="true" />
+    <uses-feature 
+        android:name="android.hardware.faketouch"
+        android:required="false"/>
+    <uses-feature 
+        android:name="android.hardware.telephony"
+        android:required="false"/>
+    <uses-feature 
+        android:name="android.hardware.camera"
+        android:required="false"/>
 
+    <!-- Permissions -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    
+    <!-- Media Permissions - Audio/Video autoplay -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
     <queries>
         <intent>
@@ -42,26 +51,31 @@
         android:banner="@drawable/banner"
         android:fullBackupContent="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="FLauncher">
+        android:label="Moonode Launcher"
+        android:usesCleartextTraffic="true"
+        android:hardwareAccelerated="true">
+        
+        <!-- Main Activity - HOME Launcher -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:exported="true"
             android:hardwareAccelerated="true"
             android:launchMode="singleTask"
+            android:clearTaskOnLaunch="true"
+            android:stateNotNeeded="true"
             android:screenOrientation="landscape"
             android:theme="@style/LaunchTheme"
             android:windowSoftInputMode="adjustResize">
+            
             <meta-data
                 android:name="io.flutter.embedding.android.NormalTheme"
                 android:resource="@style/NormalTheme" />
             <meta-data
                 android:name="io.flutter.embedding.android.SplashScreenDrawable"
                 android:resource="@drawable/launch_background" />
-            <meta-data
-                android:name="firebase_crashlytics_collection_enabled"
-                android:value="false" />
 
+            <!-- HOME Launcher Intent Filters -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
@@ -72,6 +86,21 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Boot Receiver - Auto-start on device boot -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </receiver>
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
