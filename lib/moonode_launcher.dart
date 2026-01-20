@@ -93,23 +93,6 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
     if (platform is AndroidWebViewController) {
       // Allow media playback without user gesture (THE KEY FIX!)
       platform.setMediaPlaybackRequiresUserGesture(false);
-      
-      // Allow file access for local media
-      platform.setAllowContentAccess(true);
-      
-      // Handle permission requests for camera/microphone
-      platform.setOnShowFileSelector((params) async {
-        // Return empty list for now - can be extended for file uploads
-        return [];
-      });
-      
-      // Handle geolocation permissions (if needed)
-      platform.setGeolocationPermissionsPromptCallbacks(
-        onShowPrompt: (request) async {
-          // Auto-grant geolocation for trusted moonode.tv
-          request.grant(request.origin);
-        },
-      );
     }
     
     // Load moonode.tv
