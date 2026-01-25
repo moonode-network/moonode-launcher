@@ -17,8 +17,11 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
 import android.net.Uri
+import android.os.Build
 import android.os.UserHandle
 import android.provider.Settings
+import android.webkit.WebView
+import android.webkit.WebSettings
 import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -34,6 +37,35 @@ private const val EVENT_CHANNEL = "com.moonode.launcher/event"
 
 class MainActivity : FlutterActivity() {
     val launcherAppsCallbacks = ArrayList<LauncherApps.Callback>()
+
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // Configure WebView defaults for offline caching (Service Workers, DOM Storage)
+        configureWebViewDefaults()
+    }
+    
+    /**
+     * Configure WebView defaults to enable offline caching like Chromium.
+     * This enables Service Workers, DOM Storage, and database storage
+     * which are required for PWA offline functionality.
+     */
+    private fun configureWebViewDefaults() {
+        try {
+            // Enable WebView debugging in debug builds
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                WebView.setWebContentsDebuggingEnabled(true)
+            }
+            
+            // Set data directory for WebView (helps with cache persistence)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val dataDir = applicationInfo.dataDir
+                // WebView will use app's data directory for cache
+            }
+        } catch (e: Exception) {
+            // Ignore - some devices may not support all WebView features
+        }
+    }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)

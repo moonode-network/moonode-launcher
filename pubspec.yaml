@@ -1,7 +1,7 @@
 name: moonode_launcher
 description: Moonode Launcher - Auto-launch moonode.tv on Android TV
 
-version: 1.0.0+1
+version: 1.0.3+4
 
 environment:
   sdk: ">=3.0.0 <4.0.0"

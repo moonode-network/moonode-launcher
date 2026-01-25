@@ -6,3 +6,6 @@
 -keep class io.flutter.**  { *; }
 -keep class io.flutter.plugins.**  { *; }
 -dontwarn io.flutter.embedding.**
+
+## Play Core Library (not needed for TV launcher)
+-dontwarn com.google.android.play.core.splitcompat.SplitCompatApplication
