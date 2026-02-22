@@ -1,6 +1,6 @@
 /*
  * Moonode Launcher
- * Copyright (C) 2025 Moonode
+ * Copyright (C) 2026 Moonode
  *
  * Main launcher widget - displays moonode.tv in fullscreen WebView
  */
@@ -38,6 +38,7 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
   bool _initialLoadComplete = false;
   bool _isOffline = false;
   String _appVersion = '';
+  bool _isSettingsOpen = false;
 
   // Moonode TV URL - the main content
   static const String moonodeTvUrl = 'https://moonode.tv';
@@ -48,6 +49,22 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
     _loadAppVersion();
     _checkConnectivity();
     _initWebView();
+    _registerNativeKeyHandler();
+  }
+
+  void _registerNativeKeyHandler() {
+    widget.launcherChannel.setKeyEventHandler(
+      onOpenSettings: _openSettings,
+      onOpenAndroidSettings: _openAndroidSettings,
+      onGoHome: _goHome,
+    );
+  }
+
+  void _goHome() {
+    if (_isSettingsOpen) {
+      Navigator.of(context).popUntil((route) => route.isFirst);
+      _isSettingsOpen = false;
+    }
   }
 
   Future<void> _loadAppVersion() async {
@@ -213,6 +230,8 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
   }
 
   void _openSettings() {
+    if (_isSettingsOpen) return;
+    _isSettingsOpen = true;
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (context) => SettingsScreen(
@@ -220,7 +239,14 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
           sharedPreferences: widget.sharedPreferences,
         ),
       ),
-    );
+    ).then((_) {
+      _isSettingsOpen = false;
+    });
+  }
+
+  /// Open Android System Settings directly (escape hatch if launcher fails)
+  void _openAndroidSettings() {
+    widget.launcherChannel.openSettings();
   }
 
   void _retryLoading() {
@@ -248,12 +274,18 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
       body: KeyboardListener(
         focusNode: FocusNode()..requestFocus(),
         onKeyEvent: (KeyEvent event) {
-          // Open settings on Menu button press
           if (event is KeyDownEvent) {
+            // Open launcher settings on Menu/F1 button press
             if (event.logicalKey == LogicalKeyboardKey.contextMenu ||
                 event.logicalKey == LogicalKeyboardKey.f1 ||
                 event.logicalKey == LogicalKeyboardKey.settings) {
               _openSettings();
+            }
+            // ESCAPE HATCH: Open Android Settings on F2 or Escape key
+            // This allows recovery even if screen is black/stuck
+            if (event.logicalKey == LogicalKeyboardKey.f2 ||
+                event.logicalKey == LogicalKeyboardKey.escape) {
+              _openAndroidSettings();
             }
           }
         },
@@ -359,30 +391,45 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
                             ),
                           ),
                           const SizedBox(height: 32),
-                          ElevatedButton.icon(
-                            onPressed: _retryLoading,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: const Color(0xFFF5D742),
-                              foregroundColor: const Color(0xFF0A0E17),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 32,
-                                vertical: 16,
-                              ),
-                            ),
-                            icon: const Icon(Icons.refresh),
-                            label: const Text(
-                              'Retry',
-                              style: TextStyle(fontSize: 18),
-                            ),
+                      ElevatedButton.icon(
+                        onPressed: _retryLoading,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFF5D742),
+                          foregroundColor: const Color(0xFF0A0E17),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 32,
+                            vertical: 16,
                           ),
-                          const SizedBox(height: 16),
-                          TextButton(
+                        ),
+                        icon: const Icon(Icons.refresh),
+                        label: const Text(
+                          'Retry',
+                          style: TextStyle(fontSize: 18),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          TextButton.icon(
                             onPressed: _openSettings,
-                            child: const Text(
-                              'Open Settings',
-                              style: TextStyle(color: Color(0xFF4FB3FF)),
+                            icon: const Icon(Icons.apps, size: 18),
+                            label: const Text('Launcher Settings'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: const Color(0xFF4FB3FF),
                             ),
                           ),
+                          const SizedBox(width: 24),
+                          TextButton.icon(
+                            onPressed: _openAndroidSettings,
+                            icon: const Icon(Icons.settings, size: 18),
+                            label: const Text('Android Settings'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: const Color(0xFFFF6B6B),
+                            ),
+                          ),
+                        ],
+                      ),
                         ],
                       ),
                     ),

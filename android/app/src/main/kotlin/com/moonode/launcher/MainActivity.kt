@@ -1,6 +1,6 @@
 /*
  * Moonode Launcher
- * Copyright (C) 2025 Moonode
+ * Copyright (C) 2026 Moonode
  *
  * Based on FLauncher by Étienne Fesser (GPL-3.0)
  * Modified for Moonode TV integration
@@ -20,6 +20,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.UserHandle
 import android.provider.Settings
+import android.view.KeyEvent
 import android.webkit.WebView
 import android.webkit.WebSettings
 import androidx.annotation.NonNull
@@ -34,9 +35,11 @@ import java.io.Serializable
 
 private const val METHOD_CHANNEL = "com.moonode.launcher/method"
 private const val EVENT_CHANNEL = "com.moonode.launcher/event"
+private const val KEY_EVENT_CHANNEL = "com.moonode.launcher/keyEvent"
 
 class MainActivity : FlutterActivity() {
     val launcherAppsCallbacks = ArrayList<LauncherApps.Callback>()
+    private var keyEventChannel: MethodChannel? = null
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
@@ -67,8 +70,37 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.hasCategory(CATEGORY_HOME)) {
+            keyEventChannel?.invokeMethod("goHome", null)
+        }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            val keyAction = when (event.keyCode) {
+                KeyEvent.KEYCODE_MENU,
+                KeyEvent.KEYCODE_F1,
+                KeyEvent.KEYCODE_SETTINGS,
+                KeyEvent.KEYCODE_BOOKMARK,
+                KeyEvent.KEYCODE_GUIDE -> "openSettings"
+
+                KeyEvent.KEYCODE_F2 -> "openAndroidSettings"
+
+                else -> null
+            }
+            if (keyAction != null) {
+                keyEventChannel?.invokeMethod(keyAction, null)
+                return true
+            }
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        keyEventChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, KEY_EVENT_CHANNEL)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "getApplications" -> result.success(getApplications())

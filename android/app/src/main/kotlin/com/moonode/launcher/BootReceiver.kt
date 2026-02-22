@@ -1,6 +1,6 @@
 /*
  * Moonode Launcher
- * Copyright (C) 2025 Moonode
+ * Copyright (C) 2026 Moonode
  *
  * BootReceiver - Starts the launcher automatically on device boot
  * Based on Moonode Android-TV BootReceiver pattern

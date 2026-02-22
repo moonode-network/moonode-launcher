@@ -271,3 +271,70 @@ adb connect 192.168.100.5:5555
 # Add to PATH (add to ~/.zshrc or ~/.bashrc)
 export PATH=$PATH:~/Library/Android/sdk/platform-tools
 ```
+
+## Factory Reset / Recovery
+
+If the launcher bricks the device and you need to recover:
+
+### Method 1: ADB Recovery (if ADB still connects)
+```bash
+# Connect to device
+adb connect <DEVICE_IP>:5555
+
+# Re-enable original launchers
+adb shell pm enable com.google.android.apps.tv.launcherx
+adb shell pm enable com.google.android.tvlauncher
+adb shell pm enable com.google.android.tungsten.setupwraith
+adb shell pm enable com.google.android.leanbacklauncher
+
+# Uninstall Moonode Launcher
+adb uninstall com.moonode.launcher
+
+# Reboot
+adb reboot
+```
+
+### Method 2: Safe Mode Boot
+1. Unplug device power
+2. Hold **BACK** button on remote while plugging power back in
+3. Keep holding until "Safe Mode" appears in corner
+4. Go to Settings → Apps → Moonode Launcher → Uninstall
+5. Reboot normally
+
+### Method 3: Recovery Mode (Hardware Reset)
+1. Find reset **pinhole** on device (near HDMI/power ports)
+2. With device OFF, insert paperclip into reset hole
+3. Hold while plugging in power
+4. Keep holding 10-15 seconds until recovery appears
+5. Select "Wipe data/factory reset"
+6. Confirm and reboot
+
+### Method 4: Button Combos (device-specific)
+Hold while powering on:
+- Power + Volume Down
+- Power + Volume Up  
+- Back + Home (on remote)
+
+### Method 5: Android Debug Bridge Factory Reset
+```bash
+# Nuclear option - full factory reset via ADB
+adb shell am broadcast -a android.intent.action.MASTER_CLEAR
+
+# Or recovery mode reboot
+adb reboot recovery
+```
+
+### Prevention: Always Keep ADB Enabled
+Before testing launcher changes, ensure:
+- USB Debugging is ON
+- Network ADB is ON  
+- You know the device IP
+- ADB can connect before you install
+
+### Built-in Escape Hatches (Moonode Launcher v1.0.4+)
+If launcher shows black screen or error:
+- **F2 key** or **Escape key** → Opens Android System Settings directly
+- **F1 key** or **Menu button** → Opens Launcher Settings
+- Error screen has **"Android Settings"** button (red text)
+
+These work even if moonode.tv fails to load!

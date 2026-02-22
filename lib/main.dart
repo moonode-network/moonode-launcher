@@ -1,6 +1,6 @@
 /*
  * Moonode Launcher
- * Copyright (C) 2025 Moonode
+ * Copyright (C) 2026 Moonode
  *
  * The smart launcher for Moonode TV screens
  * Connecting organizations to their communities
