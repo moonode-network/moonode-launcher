@@ -24,6 +24,10 @@ adb devices
 
 adb connect <IP>:5555
 
-# RUN SCRIPT
+# RUN SCRIPT (macOS / Linux)
 
 ./scripts/setup-moonode-launcher.sh
+
+# RUN SCRIPT (Windows PowerShell)
+
+.\scripts\setup-moonode-launcher.ps1
