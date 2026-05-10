@@ -111,6 +111,8 @@ class MainActivity : FlutterActivity() {
                 "uninstallApp" -> result.success(uninstallApp(call.arguments as String))
                 "isDefaultLauncher" -> result.success(isDefaultLauncher())
                 "checkForGetContentAvailability" -> result.success(checkForGetContentAvailability())
+                "chooseDefaultLauncher" -> result.success(chooseDefaultLauncher())
+                "getDeviceInfo" -> result.success(getDeviceInfo())
                 else -> throw IllegalArgumentException()
             }
         }
@@ -255,6 +257,75 @@ class MainActivity : FlutterActivity() {
         defaultLauncher?.activityInfo?.packageName == packageName
     } catch (e: Exception) {
         false
+    }
+
+    /**
+     * Open the system "Choose default launcher" UI so the user can pick a different
+     * HOME launcher (or re-pick Moonode). Behaviour by platform:
+     *   - Android TV / AOSP: ACTION_HOME_SETTINGS opens the launcher picker.
+     *   - Fire TV: ACTION_HOME_SETTINGS does not exist; we fall back to opening
+     *     this app's details page so the user can "Clear defaults" or uninstall
+     *     Moonode entirely and return to the Amazon launcher.
+     *   - Last-resort fallback: open generic Android Settings.
+     */
+    private fun chooseDefaultLauncher(): Boolean {
+        // 1) Try the dedicated HOME settings screen (works on most Android TV builds).
+        try {
+            val homeSettings = Intent(Settings.ACTION_HOME_SETTINGS)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (homeSettings.resolveActivity(packageManager) != null) {
+                startActivity(homeSettings)
+                return true
+            }
+        } catch (_: Exception) {
+            // fall through
+        }
+
+        // 2) Fire TV / devices without HOME_SETTINGS: open our own app info page.
+        //    From there the user can press "Clear defaults" (if Moonode is the
+        //    default) or "Uninstall" to fully revert to the stock launcher.
+        try {
+            val appDetails = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(Uri.fromParts("package", packageName, null))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            if (appDetails.resolveActivity(packageManager) != null) {
+                startActivity(appDetails)
+                return true
+            }
+        } catch (_: Exception) {
+            // fall through
+        }
+
+        // 3) Generic settings as last resort.
+        return try {
+            startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Expose device fingerprint to Dart so the UI can adapt (e.g. show
+     * Fire-TV-specific recovery instructions next to the "Choose Default
+     * Launcher" button).
+     */
+    private fun getDeviceInfo(): Map<String, Any?> {
+        val manufacturer = Build.MANUFACTURER ?: ""
+        val brand = Build.BRAND ?: ""
+        val model = Build.MODEL ?: ""
+        val isFireTv = manufacturer.equals("Amazon", ignoreCase = true) ||
+            brand.equals("Amazon", ignoreCase = true) ||
+            model.lowercase().startsWith("aft")
+        val isAndroidTv = packageManager.hasSystemFeature("android.software.leanback")
+        return mapOf(
+            "manufacturer" to manufacturer,
+            "brand" to brand,
+            "model" to model,
+            "sdkInt" to Build.VERSION.SDK_INT,
+            "isFireTv" to isFireTv,
+            "isAndroidTv" to isAndroidTv,
+        )
     }
 
     private fun drawableToByteArray(drawable: Drawable): ByteArray {

@@ -2,7 +2,11 @@
  * Moonode Launcher
  * Copyright (C) 2026 Moonode
  *
- * Settings screen - Quick actions and system settings access
+ * Settings screen - Quick actions and system settings access.
+ *
+ * Includes a "Choose Default Launcher" recovery action so the user can always
+ * fall back to the stock launcher (Android TV: opens the system HOME picker;
+ * Fire TV: opens this app's info page so they can clear defaults / uninstall).
  */
 
 import 'package:flutter/material.dart';
@@ -27,27 +31,79 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   bool _isDefaultLauncher = false;
+  bool _isFireTv = false;
   String _appVersion = '';
 
   @override
   void initState() {
     super.initState();
     _checkDefaultLauncher();
+    _loadDeviceInfo();
     _loadAppVersion();
   }
 
   Future<void> _checkDefaultLauncher() async {
     final isDefault = await widget.launcherChannel.isDefaultLauncher();
+    if (!mounted) return;
     setState(() {
       _isDefaultLauncher = isDefault;
     });
   }
 
+  Future<void> _loadDeviceInfo() async {
+    try {
+      final info = await widget.launcherChannel.getDeviceInfo();
+      if (!mounted) return;
+      setState(() {
+        _isFireTv = info['isFireTv'] == true;
+      });
+    } catch (_) {
+      // Older builds without getDeviceInfo - safe default.
+    }
+  }
+
   Future<void> _loadAppVersion() async {
     final packageInfo = await PackageInfo.fromPlatform();
+    if (!mounted) return;
     setState(() {
       _appVersion = 'v${packageInfo.version}+${packageInfo.buildNumber}';
     });
+  }
+
+  Future<void> _confirmAndChooseLauncher() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1F2E),
+        title: const Text(
+          'Choose Default Launcher',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: Text(
+          _isFireTv
+              ? 'Fire TV does not let you swap the HOME launcher from a picker. '
+                  'We will open this app\u2019s info page so you can press '
+                  '\u201cClear defaults\u201d or \u201cUninstall\u201d to return '
+                  'to the Amazon launcher.'
+              : 'This will open the system HOME launcher picker so you can '
+                  'switch back to your previous launcher (or re-select Moonode).',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await widget.launcherChannel.chooseDefaultLauncher();
+    }
   }
 
   @override
@@ -79,7 +135,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                // Default launcher status
                 Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
@@ -98,14 +153,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         size: 28,
                       ),
                       const SizedBox(width: 16),
-                      Text(
-                        _isDefaultLauncher
-                            ? 'Default Launcher'
-                            : 'Not Default Launcher',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w500,
+                      Expanded(
+                        child: Text(
+                          _isDefaultLauncher
+                              ? 'Default Launcher'
+                              : _isFireTv
+                                  ? 'Fire TV \u2014 Amazon launcher cannot be replaced via HOME picker'
+                                  : 'Not Default Launcher',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w500,
+                          ),
                         ),
                       ),
                     ],
@@ -126,10 +185,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   color: const Color(0xFFF5D742),
                   onPressed: () => widget.launcherChannel.launchMoonodeApp(),
                 ),
+                const SizedBox(height: 12),
+
+                _buildActionButton(
+                  icon: Icons.swap_horiz,
+                  label: _isFireTv
+                      ? 'Disable / Uninstall Moonode Launcher'
+                      : 'Choose Default Launcher',
+                  color: const Color(0xFFFF6B6B),
+                  onPressed: _confirmAndChooseLauncher,
+                ),
 
                 const Spacer(),
 
-                // Version & copyright
                 Center(
                   child: Column(
                     children: [
@@ -180,9 +248,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
             children: [
               Icon(icon, color: color, size: 28),
               const SizedBox(width: 16),
-              Text(
-                label,
-                style: TextStyle(color: color, fontSize: 18),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(color: color, fontSize: 18),
+                ),
               ),
             ],
           ),

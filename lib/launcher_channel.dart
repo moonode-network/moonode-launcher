@@ -71,6 +71,24 @@ class LauncherChannel {
     return await _methodChannel.invokeMethod('isDefaultLauncher');
   }
 
+  /// Open the system "Choose default launcher" UI so the user can switch
+  /// HOME to another launcher (recovery path if Moonode misbehaves).
+  ///
+  /// On Android TV / AOSP this opens the HOME settings picker.
+  /// On Fire TV (which doesn't expose a HOME picker) this falls back to
+  /// the Moonode app-info screen where the user can clear defaults or
+  /// uninstall to return to the Amazon launcher.
+  Future<bool> chooseDefaultLauncher() async {
+    return await _methodChannel.invokeMethod('chooseDefaultLauncher');
+  }
+
+  /// Returns device info used to adapt the UI (e.g. Fire TV recovery hints).
+  /// Keys: manufacturer, brand, model, sdkInt, isFireTv, isAndroidTv.
+  Future<Map<String, dynamic>> getDeviceInfo() async {
+    final result = await _methodChannel.invokeMethod('getDeviceInfo');
+    return Map<String, dynamic>.from(result as Map);
+  }
+
   /// Stream of package change events
   Stream<Map<String, dynamic>> get packageEvents {
     return _eventChannel.receiveBroadcastStream().map((event) {

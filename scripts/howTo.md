@@ -31,4 +31,4 @@ adb connect <IP>:5555
 # RUN SCRIPT (Windows - double-click or from cmd)
 
 scripts\setup-moonode-launcher.bat
-scripts\setup-moonode-launcher.bat
+scripts\setup-moonode-launcher.bat <IP>:5555
