@@ -7,6 +7,7 @@
   -->
 
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="com.moonode.launcher">
 
     <!-- TV Features -->
@@ -43,6 +44,24 @@
     <!-- Media Permissions - Audio/Video autoplay -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
 
+    <!--
+      WRITE_SECURE_SETTINGS lets the launcher silently re-enable the HOME
+      Guardian accessibility service whenever Fire OS disables it (which it
+      does on every APK reinstall and after some OS updates). This is a
+      privileged permission that ONLY takes effect once it is granted via
+      ADB at deployment time:
+
+        adb shell pm grant com.moonode.launcher android.permission.WRITE_SECURE_SETTINGS
+
+      The deployment script (scripts/setup-moonode-launcher.{sh,ps1,bat})
+      runs this command automatically. If the permission is not granted,
+      the auto-recovery silently no-ops; the launcher still works fine,
+      it just can't self-heal the HOME Guardian without manual ADB.
+    -->
+    <uses-permission
+        android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -59,7 +78,8 @@
         android:icon="@mipmap/ic_launcher"
         android:label="Moonode Launcher"
         android:usesCleartextTraffic="true"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:largeHeap="true">
         
         <!-- Main Activity - HOME Launcher -->
         <activity
@@ -81,8 +101,15 @@
                 android:name="io.flutter.embedding.android.SplashScreenDrawable"
                 android:resource="@drawable/launch_background" />
 
-            <!-- HOME Launcher Intent Filters -->
-            <intent-filter>
+            <!--
+              HOME Launcher Intent Filters.
+              priority=999 is the maximum third-party value Android honours and
+              is needed to outrank Amazon Fire TV's stock HOME activities
+              (com.amazon.tv.launcher = priority 950, com.amazon.firehomestarter
+              = priority 1). On Android TV / AOSP this is a no-op because the
+              system launcher picker is the source of truth there.
+            -->
+            <intent-filter android:priority="999">
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.DEFAULT" />
@@ -106,6 +133,25 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>
+
+        <!--
+          HOME Hijack accessibility service (Fire TV only in practice).
+          Disabled by default; user must enable it from Settings -> Accessibility.
+          BIND_ACCESSIBILITY_SERVICE is mandated by Android so the system can
+          guarantee only the OS binds to this service.
+        -->
+        <service
+            android:name=".HomeHijackService"
+            android:exported="true"
+            android:label="Moonode HOME Guardian"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
         <meta-data
             android:name="flutterEmbedding"

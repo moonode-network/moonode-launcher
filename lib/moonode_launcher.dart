@@ -30,7 +30,7 @@ class MoonodeLauncher extends StatefulWidget {
   State<MoonodeLauncher> createState() => _MoonodeLauncherState();
 }
 
-class _MoonodeLauncherState extends State<MoonodeLauncher> {
+class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingObserver {
   late final WebViewController _webViewController;
   bool _isLoading = true;
   bool _hasError = false;
@@ -46,10 +46,46 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadAppVersion();
     _checkConnectivity();
     _initWebView();
     _registerNativeKeyHandler();
+    _refreshHijackStatus();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Re-check the HOME Guardian whenever Moonode comes back to the foreground
+    // - the most likely time it was just disabled by Fire OS / an APK reinstall.
+    if (state == AppLifecycleState.resumed) {
+      _refreshHijackStatus();
+    }
+  }
+
+  /// On Fire TV, silently re-enable the HOME Guardian accessibility service
+  /// if Fire OS has disabled it. This works because the deployment script
+  /// (setup-moonode-launcher.sh) ADB-grants WRITE_SECURE_SETTINGS so the
+  /// launcher can self-heal without any user interaction. If the permission
+  /// was never granted (e.g. someone sideloaded the APK without the script),
+  /// this silently no-ops - HOME just won't bounce, but Moonode keeps working.
+  Future<void> _refreshHijackStatus() async {
+    try {
+      final info = await widget.launcherChannel.getDeviceInfo();
+      final isFireTv = info['isFireTv'] == true;
+      if (!isFireTv) return;
+      final enabled = await widget.launcherChannel.isHomeHijackEnabled();
+      if (enabled) return;
+      await widget.launcherChannel.enableHomeHijackService();
+    } catch (_) {
+      // Older builds without the channel methods: nothing to do.
+    }
   }
 
   void _registerNativeKeyHandler() {
@@ -109,13 +145,57 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
                 _hasError = false;
               });
             }
-            
-            // Inject viewport fix early to prevent zoom flash
+
+            // Inject viewport fix + render-process-gone auto-recovery early.
+            //
+            // Background: Fire TV Stick (1st gen) has only ~921 MB total RAM.
+            // Chromium's sandboxed renderer for this WebView runs at ~265 MB
+            // and when the system runs out of memory the lowmemorykiller will
+            // kill it as `fore TOP`. The WebView restarts itself but lands
+            // back on the moonode.tv root URL, looking to the user like the
+            // launcher just rebooted.
+            //
+            // To make recovery invisible: we keep `moonode_last_screen` in
+            // localStorage (Service Worker survives the restart, so does its
+            // localStorage). On every page start, if we just landed on root
+            // BUT we have a recent screen-id stashed, jump straight to it
+            // with replace() so the splash doesn't show and history isn't
+            // polluted.
             _webViewController.runJavaScript('''
-              var meta = document.createElement('meta');
-              meta.name = 'viewport';
-              meta.content = 'width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no';
-              if (document.head) document.head.appendChild(meta);
+              (function(){
+                try {
+                  var meta = document.createElement('meta');
+                  meta.name = 'viewport';
+                  meta.content = 'width=device-width, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no';
+                  if (document.head) document.head.appendChild(meta);
+                } catch(_) {}
+
+                try {
+                  var path = window.location.pathname || '';
+                  var isRoot = path === '/' || path === '' || path === '/index.html';
+                  if (isRoot) {
+                    var raw = window.localStorage && window.localStorage.getItem('moonode_last_screen');
+                    if (raw) {
+                      var saved = JSON.parse(raw);
+                      var ageMs = Date.now() - (saved.savedAt || 0);
+                      // Only auto-rejoin if the stash is fresh (< 6h) so we
+                      // don't permanently pin a stale screen-id from days ago.
+                      if (saved.id && ageMs < 6 * 60 * 60 * 1000) {
+                        window.location.replace('/' + saved.id);
+                      }
+                    }
+                  } else {
+                    // We're on a real screen - persist it for next recovery.
+                    var id = path.replace(/^\\//, '').split(/[\\/?#]/)[0];
+                    if (id) {
+                      window.localStorage.setItem(
+                        'moonode_last_screen',
+                        JSON.stringify({ id: id, savedAt: Date.now() })
+                      );
+                    }
+                  }
+                } catch(_) {}
+              })();
             ''');
           },
           onPageFinished: (String url) {
@@ -128,12 +208,18 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
               _errorMessage = '';
             });
             
-            // Save current URL for offline recovery
+            // Save current URL for offline recovery + cold-start auto-recovery.
+            // The timestamp is used by `_resolveStartupUrl()` to decide whether
+            // a cached screen-id is still fresh enough to deep-link into when
+            // a brand-new process spawns (after a memory kill, reboot, etc).
             if (url.contains('/') && url != moonodeTvUrl) {
-              // Extract screen ID from URL like moonode.tv/abc123
               final uri = Uri.parse(url);
               if (uri.pathSegments.isNotEmpty) {
                 widget.sharedPreferences.setString('cached_screen_id', uri.pathSegments.first);
+                widget.sharedPreferences.setInt(
+                  'cached_screen_id_at',
+                  DateTime.now().millisecondsSinceEpoch,
+                );
               }
             }
             
@@ -224,9 +310,38 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> {
     _webViewController.setUserAgent(
       'Mozilla/5.0 (Linux; Android TV; Moonode Launcher) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
-    
-    // Load moonode.tv
-    _webViewController.loadRequest(Uri.parse(moonodeTvUrl));
+
+    // Cold-start recovery: on Fire TV Stick (~921 MB RAM) the OS routinely
+    // kills our entire foreground process under memory pressure. When the
+    // system relaunches us via the HOME intent, we land here in a brand-new
+    // process. If we just blindly load `moonode.tv` root, the user sees a
+    // visible "reload" back to the home/splash. Instead, if we have a recent
+    // screen-id stashed from a prior session, jump straight to that URL.
+    //
+    // The 6h freshness window matches the JS-side localStorage check so the
+    // two recovery paths agree on what counts as "still relevant".
+    final initialUrl = _resolveStartupUrl();
+    _webViewController.loadRequest(Uri.parse(initialUrl));
+  }
+
+  /// Pick the URL to load on launcher start. Defaults to moonode.tv root, but
+  /// if a recent screen-id is cached we jump directly there to make process
+  /// kill recovery invisible to the user.
+  String _resolveStartupUrl() {
+    try {
+      final cachedId = widget.sharedPreferences.getString('cached_screen_id');
+      final savedAtMs = widget.sharedPreferences.getInt('cached_screen_id_at') ?? 0;
+      if (cachedId != null && cachedId.isNotEmpty) {
+        final ageMs = DateTime.now().millisecondsSinceEpoch - savedAtMs;
+        // 6h freshness window - long enough to survive overnight standby,
+        // short enough that a stale screen-id doesn't pin a customer to an
+        // outdated playlist forever after they've moved the device.
+        if (savedAtMs > 0 && ageMs < 6 * 60 * 60 * 1000) {
+          return '$moonodeTvUrl/$cachedId';
+        }
+      }
+    } catch (_) {}
+    return moonodeTvUrl;
   }
 
   void _openSettings() {

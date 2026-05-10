@@ -102,6 +102,19 @@ if %ERRORLEVEL% neq 0 (
 echo   Moonode Launcher installed!
 echo.
 
+REM Grant WRITE_SECURE_SETTINGS so the launcher can self-heal HOME Guardian.
+echo   Granting self-heal permission (WRITE_SECURE_SETTINGS)...
+adb shell pm grant com.moonode.launcher android.permission.WRITE_SECURE_SETTINGS >nul 2>&1
+echo   Self-heal permission granted (or already present)!
+echo.
+
+REM Enable HOME Guardian accessibility service from first boot.
+echo   Enabling HOME Guardian accessibility service...
+adb shell settings put secure enabled_accessibility_services com.moonode.launcher/com.moonode.launcher.HomeHijackService >nul 2>&1
+adb shell settings put secure accessibility_enabled 1 >nul 2>&1
+echo   HOME Guardian enabled!
+echo.
+
 REM Disable known launchers
 echo   Disabling default launchers...
 adb shell pm disable-user --user 0 com.google.android.apps.tv.launcherx >nul 2>&1
@@ -126,6 +139,25 @@ REM Keep screen always on
 echo   Configuring kiosk settings...
 adb shell settings put system screen_off_timeout 2147483647 >nul 2>&1
 echo   Kiosk settings configured!
+echo.
+
+REM Reduce memory pressure on low-RAM Fire TV Sticks. Safe on Android TV
+REM (commands no-op when packages don't exist).
+echo   Reducing Fire TV memory pressure (disabling non-essential services)...
+adb shell pm disable-user --user 0 com.amazon.client.metrics >nul 2>&1
+adb shell pm disable-user --user 0 com.amazon.device.messaging >nul 2>&1
+adb shell pm disable-user --user 0 com.amazon.tv.parentalcontrols >nul 2>&1
+adb shell pm disable-user --user 0 com.amazon.diode >nul 2>&1
+echo   Memory pressure reduced!
+echo.
+
+REM Fire TV / Fire OS auto-update lockdown. Safe on Android TV (commands no-op
+REM when packages don't exist).
+echo   Locking down auto-updates (Fire TV protections)...
+adb shell settings put global app_auto_download 0 >nul 2>&1
+adb shell settings put global ota_disable_automatic_update 1 >nul 2>&1
+adb shell pm disable-user --user 0 com.amazon.tv.forcedotaupdater.v2 >nul 2>&1
+echo   Auto-update protections applied!
 echo.
 
 REM Reset overscan

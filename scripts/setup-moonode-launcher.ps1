@@ -168,6 +168,17 @@ if ($LASTEXITCODE -ne 0) {
 Write-Success "Moonode Launcher installed!"
 Write-Host ""
 
+# Grant WRITE_SECURE_SETTINGS so the launcher can self-heal the HOME Guardian
+# accessibility service after Fire OS auto-disables it.
+Write-Status "Granting self-heal permission (WRITE_SECURE_SETTINGS)..."
+Invoke-Adb @("shell", "pm", "grant", "com.moonode.launcher", "android.permission.WRITE_SECURE_SETTINGS") | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Success "Self-heal permission granted!"
+} else {
+    Write-Warn "Could not grant WRITE_SECURE_SETTINGS - HOME Guardian will need manual re-enable if Fire OS disables it"
+}
+Write-Host ""
+
 # Detect current default launcher
 Write-Status "Detecting current launcher..."
 $resolveOutput = Invoke-Adb @("shell", "cmd", "package", "resolve-activity", "-a", "android.intent.action.MAIN", "-c", "android.intent.category.HOME")
@@ -222,6 +233,51 @@ Invoke-Adb @("shell", "settings", "put", "system", "screen_off_timeout", "214748
 Write-Success "Kiosk settings configured!"
 Write-Host ""
 
+# Fire TV / Fire OS specific: lock down auto-updates so the OS does not silently
+# re-enable Amazon launcher packages, push OS updates that change behaviour, or
+# pull APK updates from the Appstore overnight. Safe on Android TV too - the
+# package commands fail silently when the package does not exist.
+# Enable HOME Guardian accessibility service immediately - HOME is protected
+# from first boot, no need to wait for the launcher to detect it's off.
+Write-Status "Enabling HOME Guardian accessibility service..."
+$hijackComponent = "com.moonode.launcher/com.moonode.launcher.HomeHijackService"
+$existingSvcs = (Invoke-Adb @("shell", "settings", "get", "secure", "enabled_accessibility_services")).Trim()
+if (-not $existingSvcs -or $existingSvcs -eq "null") {
+    $newSvcs = $hijackComponent
+} elseif ($existingSvcs -match [regex]::Escape($hijackComponent)) {
+    $newSvcs = $existingSvcs
+} else {
+    $newSvcs = "${existingSvcs}:${hijackComponent}"
+}
+Invoke-Adb @("shell", "settings", "put", "secure", "enabled_accessibility_services", $newSvcs) | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "accessibility_enabled", "1") | Out-Null
+Write-Success "HOME Guardian enabled!"
+Write-Host ""
+
+# Best-effort: try to disable Amazon memory-hog daemons. These are typically
+# protected packages on current Fire OS so the disable will silently fail -
+# the launcher's own onTrimMemory + cold-start auto-recovery covers the rest.
+$memoryHogPackages = @(
+    "com.amazon.client.metrics",
+    "com.amazon.device.messaging",
+    "com.amazon.tv.parentalcontrols",
+    "com.amazon.diode"
+)
+foreach ($pkg in $memoryHogPackages) {
+    Invoke-Adb @("shell", "pm", "disable-user", "--user", "0", $pkg) | Out-Null
+}
+
+
+Write-Status "Locking down auto-updates (Fire TV protections)..."
+Invoke-Adb @("shell", "settings", "put", "global", "app_auto_download", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "global", "ota_disable_automatic_update", "1") | Out-Null
+if ($installedPackages -match "com.amazon.tv.forcedotaupdater.v2") {
+    Write-Host "    Disabling Amazon forced OTA updater..."
+    Invoke-Adb @("shell", "pm", "disable-user", "--user", "0", "com.amazon.tv.forcedotaupdater.v2") | Out-Null
+}
+Write-Success "Auto-update protections applied!"
+Write-Host ""
+
 # Reset overscan
 Write-Status "Configuring display settings..."
 Write-Host "    Resetting overscan to 100% (full screen)..."
@@ -254,6 +310,8 @@ Write-Host "    * Default launcher disabled"
 Write-Host "    * 'No Internet' warnings disabled"
 Write-Host "    * Screen set to always-on"
 Write-Host "    * Display overscan reset (full screen)"
+Write-Host "    * Fire TV auto-updates suppressed (apps + forced OTAs)"
+Write-Host "    * HOME Guardian enabled + self-healing (via WRITE_SECURE_SETTINGS grant)"
 Write-Host ""
 Write-Host "  Next steps:"
 Write-Host "    1. Press the HOME button on your TV remote"

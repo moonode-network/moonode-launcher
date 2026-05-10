@@ -166,6 +166,17 @@ $ADB_CMD install -r "$APK_PATH" || {
 echo -e "${GREEN}Moonode Launcher installed!${NC}"
 echo ""
 
+# Grant WRITE_SECURE_SETTINGS so the launcher can self-heal the HOME Guardian
+# accessibility service after Fire OS auto-disables it (which happens on every
+# APK reinstall and after some OS updates). Without this, the user would need
+# to manually re-toggle the service in Accessibility settings each time.
+# This grant requires ADB and persists for the life of the install.
+echo -e "${BLUE}Granting self-heal permission (WRITE_SECURE_SETTINGS)...${NC}"
+$ADB_CMD shell pm grant com.moonode.launcher android.permission.WRITE_SECURE_SETTINGS 2>/dev/null && \
+    echo -e "${GREEN}Self-heal permission granted!${NC}" || \
+    echo -e "${YELLOW}Could not grant WRITE_SECURE_SETTINGS - HOME Guardian will need manual re-enable if Fire OS disables it${NC}"
+echo ""
+
 # Detect current default launcher
 echo -e "${BLUE}Detecting current launcher...${NC}"
 CURRENT_LAUNCHER=$($ADB_CMD shell cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME | grep packageName | head -1 | cut -d'=' -f2 | tr -d '\r')
@@ -215,6 +226,63 @@ $ADB_CMD shell settings put system screen_off_timeout 2147483647 2>/dev/null || 
 echo -e "${GREEN}Kiosk settings configured!${NC}"
 echo ""
 
+# Fire TV / Fire OS specific: lock down auto-updates so the OS does not silently
+# re-enable Amazon launcher packages, push OS updates that change behaviour, or
+# pull APK updates from the Appstore overnight. Safe to run on Android TV too -
+# the package commands fail silently when the package does not exist.
+# Enable the HOME Guardian accessibility service immediately. The launcher
+# will also self-heal it on subsequent starts via WRITE_SECURE_SETTINGS, but
+# enabling it here guarantees HOME button protection is live from the very
+# first boot - no need to wait for the user to open Moonode.
+echo -e "${BLUE}Enabling HOME Guardian accessibility service...${NC}"
+HIJACK_COMPONENT="com.moonode.launcher/com.moonode.launcher.HomeHijackService"
+EXISTING_SVCS=$($ADB_CMD shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r\n')
+if [ -z "$EXISTING_SVCS" ] || [ "$EXISTING_SVCS" = "null" ]; then
+    NEW_SVCS="$HIJACK_COMPONENT"
+elif echo "$EXISTING_SVCS" | grep -q "$HIJACK_COMPONENT"; then
+    NEW_SVCS="$EXISTING_SVCS"
+else
+    NEW_SVCS="$EXISTING_SVCS:$HIJACK_COMPONENT"
+fi
+$ADB_CMD shell settings put secure enabled_accessibility_services "$NEW_SVCS" 2>/dev/null || true
+$ADB_CMD shell settings put secure accessibility_enabled 1 2>/dev/null || true
+echo -e "${GREEN}HOME Guardian enabled!${NC}"
+echo ""
+
+# Best-effort: reduce memory pressure on low-RAM Fire TV Sticks (~921 MB
+# total) by disabling non-essential Amazon background daemons. Most of these
+# are protected packages on current Fire OS builds and the disable will
+# silently fail - that's fine, the launcher's own onTrimMemory + cold-start
+# auto-recovery handles the rest. Older Fire OS builds may allow these to
+# be disabled, in which case this frees ~50-80 MB.
+MEMORY_HOG_PACKAGES=(
+    "com.amazon.client.metrics"          # Minerva analytics
+    "com.amazon.device.messaging"        # Cloud push notifications
+    "com.amazon.tv.parentalcontrols"     # Parental controls UI
+    "com.amazon.diode"                   # External event collector
+)
+for pkg in "${MEMORY_HOG_PACKAGES[@]}"; do
+    $ADB_CMD shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1 || true
+done
+
+
+echo -e "${BLUE}Locking down auto-updates (Fire TV protections)...${NC}"
+# 1) Tell the Appstore not to auto-download app updates in the background.
+$ADB_CMD shell settings put global app_auto_download 0 2>/dev/null || true
+# 2) Honour the AOSP-style flag some Fire OS builds respect for OTAs.
+$ADB_CMD shell settings put global ota_disable_automatic_update 1 2>/dev/null || true
+# 3) Disable Amazon's "forced OTA updater" package - this is the daemon that
+#    aggressively pushes Fire OS system updates. It is NOT a protected package
+#    so disable-user works. The core OTA service (com.amazon.device.software.ota)
+#    cannot be disabled without root, but without the forced updater Fire OS
+#    will not push updates aggressively in the background.
+if $ADB_CMD shell pm list packages | grep -q "com.amazon.tv.forcedotaupdater.v2"; then
+    echo "  Disabling Amazon forced OTA updater..."
+    $ADB_CMD shell pm disable-user --user 0 com.amazon.tv.forcedotaupdater.v2 2>/dev/null || true
+fi
+echo -e "${GREEN}Auto-update protections applied!${NC}"
+echo ""
+
 # Reset overscan to use full screen (no cropping)
 echo -e "${BLUE}Configuring display settings...${NC}"
 echo "  Resetting overscan to 100% (full screen)..."
@@ -247,6 +315,8 @@ echo "  ✓ Default launcher disabled"
 echo "  ✓ 'No Internet' warnings disabled"
 echo "  ✓ Screen set to always-on"
 echo "  ✓ Display overscan reset (full screen)"
+echo "  ✓ Fire TV auto-updates suppressed (apps + forced OTAs)"
+echo "  ✓ HOME Guardian enabled + self-healing (via WRITE_SECURE_SETTINGS grant)"
 echo ""
 echo "Next steps:"
 echo "  1. Press the HOME button on your TV remote"

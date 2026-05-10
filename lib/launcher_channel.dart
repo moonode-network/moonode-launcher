@@ -89,6 +89,63 @@ class LauncherChannel {
     return Map<String, dynamic>.from(result as Map);
   }
 
+  /// Whether the Moonode HOME Guardian accessibility service is currently
+  /// enabled in the system Accessibility settings. Required on Fire TV to
+  /// reclaim the HOME button (Fire OS protects its launcher from being
+  /// disabled, so we hijack it via accessibility instead).
+  Future<bool> isHomeHijackEnabled() async {
+    return await _methodChannel.invokeMethod('isHomeHijackEnabled');
+  }
+
+  /// Programmatically enable the Moonode HOME Guardian accessibility service
+  /// without any user interaction. Requires WRITE_SECURE_SETTINGS, which is
+  /// granted at install time by `setup-moonode-launcher.sh`. Returns true if
+  /// the service is enabled (or was already enabled) afterwards. Returns
+  /// false if the permission is not granted - the launcher should then fall
+  /// back to opening Accessibility settings manually.
+  Future<bool> enableHomeHijackService() async {
+    return await _methodChannel.invokeMethod('enableHomeHijackService');
+  }
+
+  /// Open the system Accessibility settings page so the user can toggle
+  /// the Moonode HOME Guardian service on. Android does not allow apps to
+  /// flip this themselves.
+  Future<bool> openAccessibilitySettings() async {
+    return await _methodChannel.invokeMethod('openAccessibilitySettings');
+  }
+
+  /// Open the system Wi-Fi settings (most common reason to leave Moonode at
+  /// a customer site). Auto-pauses the HOME Guardian on the native side so
+  /// the user can switch networks without being yanked back to Moonode.
+  Future<bool> openWifiSettings() async {
+    return await _methodChannel.invokeMethod('openWifiSettings');
+  }
+
+  /// Pause HomeHijackService for [duration] so the user can navigate Fire OS
+  /// system screens without being bounced back to Moonode. The pause auto-
+  /// expires; it also auto-resumes the next time MainActivity comes to the
+  /// foreground (whichever happens first).
+  ///
+  /// Returns the actual pause duration (in ms) honoured by the native side.
+  Future<int> pauseHomeHijack({Duration duration = const Duration(minutes: 5)}) async {
+    final result = await _methodChannel.invokeMethod(
+      'pauseHomeHijack',
+      duration.inMilliseconds,
+    );
+    return (result as num).toInt();
+  }
+
+  /// Cancel any active hijack pause, re-arming HOME protection immediately.
+  Future<bool> resumeHomeHijack() async {
+    return await _methodChannel.invokeMethod('resumeHomeHijack');
+  }
+
+  /// Milliseconds remaining in the current pause window, or 0 if not paused.
+  Future<int> homeHijackPauseRemainingMs() async {
+    final result = await _methodChannel.invokeMethod('homeHijackPauseRemainingMs');
+    return (result as num).toInt();
+  }
+
   /// Stream of package change events
   Stream<Map<String, dynamic>> get packageEvents {
     return _eventChannel.receiveBroadcastStream().map((event) {

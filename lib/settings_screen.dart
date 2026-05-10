@@ -4,12 +4,13 @@
  *
  * Settings screen - Quick actions and system settings access.
  *
- * Includes a "Choose Default Launcher" recovery action so the user can always
- * fall back to the stock launcher (Android TV: opens the system HOME picker;
- * Fire TV: opens this app's info page so they can clear defaults / uninstall).
+ * Fire TV adds a "HOME Guardian" accessibility-service toggle so the user can
+ * reclaim the HOME button on devices where Amazon protects its launcher.
+ * Android TV never sees that tile because the standard launcher picker works.
  */
 
 import 'package:flutter/material.dart';
+import 'package:flutter/widgets.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -29,17 +30,41 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen> with WidgetsBindingObserver {
   bool _isDefaultLauncher = false;
   bool _isFireTv = false;
+  bool _isHomeHijackEnabled = false;
   String _appVersion = '';
 
   @override
   void initState() {
     super.initState();
-    _checkDefaultLauncher();
-    _loadDeviceInfo();
+    WidgetsBinding.instance.addObserver(this);
+    _refreshAll();
     _loadAppVersion();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // When the user comes back from system Accessibility settings, re-check
+    // whether HOME Guardian is now enabled.
+    if (state == AppLifecycleState.resumed) {
+      _refreshAll();
+    }
+  }
+
+  Future<void> _refreshAll() async {
+    await Future.wait([
+      _checkDefaultLauncher(),
+      _loadDeviceInfo(),
+      _checkHomeHijack(),
+    ]);
   }
 
   Future<void> _checkDefaultLauncher() async {
@@ -59,6 +84,18 @@ class _SettingsScreenState extends State<SettingsScreen> {
       });
     } catch (_) {
       // Older builds without getDeviceInfo - safe default.
+    }
+  }
+
+  Future<void> _checkHomeHijack() async {
+    try {
+      final enabled = await widget.launcherChannel.isHomeHijackEnabled();
+      if (!mounted) return;
+      setState(() {
+        _isHomeHijackEnabled = enabled;
+      });
+    } catch (_) {
+      // Older builds without isHomeHijackEnabled - safe default.
     }
   }
 
@@ -106,6 +143,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  void _showHijackPauseToast({required String reason}) {
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        backgroundColor: const Color(0xFF1A1F2E),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 4),
+        content: Text(
+          'HOME Guardian paused for 5 min ($reason). Returning to Moonode '
+          're-arms it instantly.',
+          style: const TextStyle(color: Colors.white),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showHomeHijackInstructions() async {
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1F2E),
+        title: const Text(
+          'Enable HOME Guardian',
+          style: TextStyle(color: Colors.white),
+        ),
+        content: const Text(
+          'Fire TV blocks third-party launchers from replacing HOME. '
+          'To make HOME always return to Moonode, we use an accessibility '
+          'service that detects when the Amazon home screen appears and '
+          'immediately switches back to Moonode.\n\n'
+          'On the next screen:\n'
+          '  1. Scroll to "Services"\n'
+          '  2. Open "Moonode HOME Guardian"\n'
+          '  3. Toggle it ON and confirm\n\n'
+          'Moonode does NOT read screen content; the service only watches '
+          'which app is in the foreground.',
+          style: TextStyle(color: Colors.white70, height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Open Accessibility Settings'),
+          ),
+        ],
+      ),
+    );
+    if (proceed == true) {
+      await widget.launcherChannel.openAccessibilitySettings();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -129,8 +221,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
       body: Center(
         child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 500),
-          child: Padding(
+          constraints: const BoxConstraints(maxWidth: 520),
+          child: SingleChildScrollView(
             padding: const EdgeInsets.all(32),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -158,7 +250,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                           _isDefaultLauncher
                               ? 'Default Launcher'
                               : _isFireTv
-                                  ? 'Fire TV \u2014 Amazon launcher cannot be replaced via HOME picker'
+                                  ? 'Fire TV \u2014 use HOME Guardian below to reclaim HOME'
                                   : 'Not Default Launcher',
                           style: const TextStyle(
                             color: Colors.white,
@@ -172,10 +264,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 24),
 
+                if (_isFireTv) ...[
+                  _buildHomeHijackTile(),
+                  const SizedBox(height: 12),
+                ],
+
+                _buildActionButton(
+                  icon: Icons.wifi,
+                  label: 'Wi-Fi Settings',
+                  color: const Color(0xFF4FB3FF),
+                  onPressed: () async {
+                    if (_isFireTv && _isHomeHijackEnabled) {
+                      _showHijackPauseToast(reason: 'Wi-Fi Settings');
+                    }
+                    await widget.launcherChannel.openWifiSettings();
+                  },
+                ),
+                const SizedBox(height: 12),
+
                 _buildActionButton(
                   icon: Icons.settings,
                   label: 'Android Settings',
-                  onPressed: () => widget.launcherChannel.openSettings(),
+                  onPressed: () async {
+                    if (_isFireTv && _isHomeHijackEnabled) {
+                      _showHijackPauseToast(reason: 'Android Settings');
+                    }
+                    await widget.launcherChannel.openSettings();
+                  },
                 ),
                 const SizedBox(height: 12),
 
@@ -187,6 +302,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
                 const SizedBox(height: 12),
 
+                if (_isFireTv && _isHomeHijackEnabled) ...[
+                  _buildActionButton(
+                    icon: Icons.pause_circle_outline,
+                    label: 'Pause HOME Guardian (5 min)',
+                    color: const Color(0xFFF5D742),
+                    onPressed: () async {
+                      await widget.launcherChannel.pauseHomeHijack();
+                      if (!mounted) return;
+                      _showHijackPauseToast(reason: 'manual pause');
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                ],
+
                 _buildActionButton(
                   icon: Icons.swap_horiz,
                   label: _isFireTv
@@ -196,7 +325,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   onPressed: _confirmAndChooseLauncher,
                 ),
 
-                const Spacer(),
+                const SizedBox(height: 32),
 
                 Center(
                   child: Column(
@@ -221,6 +350,71 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ],
             ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHomeHijackTile() {
+    final on = _isHomeHijackEnabled;
+    final color = on ? const Color(0xFF22C55E) : const Color(0xFFF5D742);
+    final label = on
+        ? 'HOME Guardian: ON \u2014 HOME returns to Moonode'
+        : 'Enable HOME Guardian (Fire TV)';
+    final subtitle = on
+        ? 'Pressing HOME on the remote will snap back to Moonode automatically.'
+        : 'Required on Fire TV. Opens Accessibility settings so you can switch '
+            'on \u201cMoonode HOME Guardian\u201d.';
+
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: on ? widget.launcherChannel.openAccessibilitySettings : _showHomeHijackInstructions,
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+          decoration: BoxDecoration(
+            border: Border.all(color: color.withOpacity(0.6)),
+            borderRadius: BorderRadius.circular(12),
+            color: on ? color.withOpacity(0.08) : Colors.transparent,
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Icon(
+                on ? Icons.shield : Icons.shield_outlined,
+                color: color,
+                size: 32,
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      style: TextStyle(
+                        color: color,
+                        fontSize: 17,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                        height: 1.3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (on)
+                const Icon(Icons.check_circle, color: Color(0xFF22C55E), size: 22),
+            ],
           ),
         ),
       ),

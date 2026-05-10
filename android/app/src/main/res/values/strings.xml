@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="home_hijack_description">Allows Moonode to bring itself back to the foreground when a stock Fire TV launcher (Amazon Home) tries to take over. This is required to use Moonode as the HOME experience on Fire TV. Moonode does not read screen content.</string>
+</resources>

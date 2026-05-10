@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Configuration for HomeHijackService.
+
+  We listen only for TYPE_WINDOW_STATE_CHANGED so the system wakes us when a
+  new top-level window comes to the foreground. We restrict packageNames to
+  the known Amazon launcher packages to minimise overhead and so the user
+  sees an honest description of what the service can observe.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/home_hijack_description"
+    android:notificationTimeout="100"
+    android:packageNames="com.amazon.tv.launcher,com.amazon.firehomestarter,com.amazon.tv.firetvui,com.amazon.firelauncher,com.amazon.tv.leanbacklauncher" />

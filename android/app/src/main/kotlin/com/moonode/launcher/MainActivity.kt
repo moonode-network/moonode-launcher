@@ -37,6 +37,14 @@ private const val METHOD_CHANNEL = "com.moonode.launcher/method"
 private const val EVENT_CHANNEL = "com.moonode.launcher/event"
 private const val KEY_EVENT_CHANNEL = "com.moonode.launcher/keyEvent"
 
+/**
+ * Default pause window applied automatically whenever the user opens a system
+ * settings screen from inside Moonode. Long enough to navigate Wi-Fi /
+ * Accessibility / Apps without HomeHijackService bouncing them back, short
+ * enough that we re-arm HOME protection if they walk away from the device.
+ */
+private const val DEFAULT_PAUSE_MS = 5L * 60L * 1000L // 5 minutes
+
 class MainActivity : FlutterActivity() {
     val launcherAppsCallbacks = ArrayList<LauncherApps.Callback>()
     private var keyEventChannel: MethodChannel? = null
@@ -77,6 +85,45 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // The user is back inside Moonode - re-arm HOME protection immediately.
+        // (We may have been paused for a Settings detour; once they return, the
+        // pause is no longer needed and Wi-Fi changes etc. are already done.)
+        HomeHijackService.resume()
+    }
+
+    /**
+     * Fire TV Stick (1st gen) has only ~921 MB total RAM and our WebView's
+     * sandboxed renderer alone consumes ~265 MB. Without intervention, the
+     * Android lowmemorykiller routinely kills our renderer as `fore TOP`,
+     * which causes the user to see the launcher visibly "reload" every minute
+     * or two. By proactively releasing memory the moment the system signals
+     * pressure, we reduce how often LMK has to kill us.
+     *
+     * onTrimMemory is called by the framework with escalating levels:
+     *   RUNNING_MODERATE / LOW / CRITICAL = visible app, system needs RAM
+     *   UI_HIDDEN                          = our UI is no longer visible
+     *   COMPLETE / MODERATE / BACKGROUND   = backgrounded, may be killed soon
+     *
+     * For a launcher that's permanently in the foreground we mostly care
+     * about the RUNNING_* levels - those are the ones that precede the LMK
+     * kill of our WebView renderer.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level >= TRIM_MEMORY_RUNNING_MODERATE) {
+            try {
+                // Hint Dalvik to do a full collection ASAP. This is normally
+                // a no-no, but on a 921 MB device under LMK pressure it can
+                // buy us a few seconds before the kernel kills the renderer.
+                System.gc()
+                Runtime.getRuntime().gc()
+            } catch (_: Throwable) { }
+            android.util.Log.i("MoonodeLauncher", "onTrimMemory level=$level - asked VM to free memory")
+        }
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
             val keyAction = when (event.keyCode) {
@@ -113,6 +160,20 @@ class MainActivity : FlutterActivity() {
                 "checkForGetContentAvailability" -> result.success(checkForGetContentAvailability())
                 "chooseDefaultLauncher" -> result.success(chooseDefaultLauncher())
                 "getDeviceInfo" -> result.success(getDeviceInfo())
+                "isHomeHijackEnabled" -> result.success(HomeHijackService.isEnabled(this))
+                "enableHomeHijackService" -> result.success(enableHomeHijackService())
+                "openAccessibilitySettings" -> result.success(openAccessibilitySettings())
+                "openWifiSettings" -> result.success(openWifiSettings())
+                "pauseHomeHijack" -> {
+                    val durationMs = (call.arguments as? Number)?.toLong() ?: DEFAULT_PAUSE_MS
+                    HomeHijackService.pauseFor(durationMs)
+                    result.success(durationMs)
+                }
+                "resumeHomeHijack" -> {
+                    HomeHijackService.resume()
+                    result.success(true)
+                }
+                "homeHijackPauseRemainingMs" -> result.success(HomeHijackService.pauseRemainingMs())
                 else -> throw IllegalArgumentException()
             }
         }
@@ -221,15 +282,50 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun openSettings() = try {
-        startActivity(Intent(Settings.ACTION_SETTINGS))
+        // Pause hijack first so HomeHijackService doesn't bounce the user back
+        // when Settings briefly transitions through the Amazon launcher window.
+        HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         true
     } catch (e: Exception) {
         false
     }
 
+    /**
+     * Open the system Wi-Fi settings directly. This is the most common reason
+     * to leave Moonode at a customer site (e.g. switching the device to the
+     * customer's Wi-Fi after install). We auto-pause the HOME hijack so the
+     * user can complete the network change without being yanked back.
+     */
+    private fun openWifiSettings(): Boolean {
+        HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        // Try Wi-Fi settings first, then fall back to network settings, then
+        // generic settings - Fire OS variants expose different actions.
+        val candidates = listOf(
+            Intent(Settings.ACTION_WIFI_SETTINGS),
+            Intent(Settings.ACTION_WIRELESS_SETTINGS),
+            Intent("com.amazon.tv.settings.NETWORK"),
+            Intent(Settings.ACTION_SETTINGS)
+        )
+        for (intent in candidates) {
+            try {
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (intent.resolveActivity(packageManager) != null) {
+                    startActivity(intent)
+                    return true
+                }
+            } catch (_: Exception) {
+                // try next
+            }
+        }
+        return false
+    }
+
     private fun openAppInfo(packageName: String) = try {
+        HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
                 .setData(Uri.fromParts("package", packageName, null))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 .let(::startActivity)
         true
     } catch (e: Exception) {
@@ -302,6 +398,98 @@ class MainActivity : FlutterActivity() {
             true
         } catch (e: Exception) {
             false
+        }
+    }
+
+    /**
+     * Programmatically enable the HOME Guardian accessibility service.
+     *
+     * Android normally requires the user to manually toggle accessibility
+     * services in Settings. We bypass this with `WRITE_SECURE_SETTINGS`
+     * which is granted at install time via ADB by the deployment script:
+     *   adb shell pm grant com.moonode.launcher android.permission.WRITE_SECURE_SETTINGS
+     *
+     * Without that grant, this method silently no-ops (returns false) - the
+     * caller can then fall back to opening the Accessibility settings page.
+     *
+     * Returns true if the service is enabled (or was already enabled) after
+     * the call. Idempotent.
+     */
+    private fun enableHomeHijackService(): Boolean {
+        val component = "$packageName/${HomeHijackService::class.java.name}"
+        try {
+            // 1) Read current enabled list. Could be null, empty, or contain other services.
+            val current = Settings.Secure.getString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ) ?: ""
+
+            // 2) Already enabled? Nothing to do.
+            val parts = current.split(':').filter { it.isNotBlank() }
+            if (parts.contains(component)) {
+                // Make sure global accessibility flag is on too.
+                Settings.Secure.putInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+                return true
+            }
+
+            // 3) Append our component without disturbing any other enabled services.
+            val updated = (parts + component).joinToString(":")
+            Settings.Secure.putString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                updated
+            )
+            Settings.Secure.putInt(contentResolver, Settings.Secure.ACCESSIBILITY_ENABLED, 1)
+            return true
+        } catch (e: SecurityException) {
+            // WRITE_SECURE_SETTINGS not granted. This is the expected path on
+            // an install where the deployment script wasn't used. The caller
+            // should fall back to openAccessibilitySettings().
+            android.util.Log.w("MoonodeLauncher", "Cannot auto-enable HOME Guardian: WRITE_SECURE_SETTINGS not granted")
+            return false
+        } catch (e: Exception) {
+            android.util.Log.w("MoonodeLauncher", "Failed to auto-enable HOME Guardian: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * Open the system Accessibility settings page so the user can flip on
+     * the Moonode HOME Guardian service. Android does not allow apps to
+     * enable an accessibility service themselves; the toggle is mandated
+     * to be a manual user action.
+     *
+     * We try to deep-link to a per-component settings screen first (some
+     * Android builds support this via the `:settings:fragment_args_key`
+     * extra), then fall back to the generic accessibility list.
+     */
+    private fun openAccessibilitySettings(): Boolean {
+        // The user is on their way to toggle our own service; the same
+        // hijack-pause logic applies so we don't bounce them.
+        HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        val component = "$packageName/${HomeHijackService::class.java.name}"
+        // Generic accessibility list - works on every Android/Fire OS build.
+        return try {
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // Used by some OEMs to highlight the right row.
+                putExtra(":settings:fragment_args_key", component)
+                val bundle = android.os.Bundle().apply {
+                    putString(":settings:fragment_args_key", component)
+                }
+                putExtra(":settings:show_fragment_args", bundle)
+            }
+            startActivity(intent)
+            true
+        } catch (e: Exception) {
+            try {
+                startActivity(
+                    Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+                true
+            } catch (e2: Exception) {
+                false
+            }
         }
     }
 
