@@ -226,11 +226,29 @@ Invoke-Adb @("shell", "settings", "put", "global", "wifi_watchdog_on", "0") | Ou
 Write-Success "Offline mode configured!"
 Write-Host ""
 
-# Keep screen always on
-Write-Status "Configuring kiosk settings..."
-Write-Host "    Setting screen to never turn off..."
+# =============================================================================
+# Kiosk power lockdown - see the .sh script for the full explanation of why
+# all three Fire OS power layers need to be disabled for signage.
+# =============================================================================
+Write-Status "Configuring kiosk power lockdown..."
+# Layer 1: AOSP inactivity sleep
 Invoke-Adb @("shell", "settings", "put", "system", "screen_off_timeout", "2147483647") | Out-Null
-Write-Success "Kiosk settings configured!"
+# Layer 2: Fire OS screensaver / DayDream
+Invoke-Adb @("shell", "settings", "put", "secure", "screensaver_enabled", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "screensaver_activate_on_sleep", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "screensaver_activate_on_dock", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "sleep_timeout", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "system", "sleep_timeout", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "screensaver_activate_after_tv_off", "0") | Out-Null
+# Layer 3: Amazon Energy Saver / 4h auto-off
+Invoke-Adb @("shell", "settings", "put", "global", "stay_on_while_plugged_in", "7") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "global", "low_power", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "global", "low_power_trigger_level", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "amazon_energy_saver_enabled", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "amazon_inactivity_sleep_enabled", "0") | Out-Null
+Invoke-Adb @("shell", "settings", "put", "secure", "inactivity_sleep_timeout", "0") | Out-Null
+Invoke-Adb @("shell", "pm", "disable-user", "--user", "0", "com.amazon.tv.ecomode") | Out-Null
+Write-Success "Kiosk power lockdown applied!"
 Write-Host ""
 
 # Fire TV / Fire OS specific: lock down auto-updates so the OS does not silently
@@ -278,13 +296,12 @@ if ($installedPackages -match "com.amazon.tv.forcedotaupdater.v2") {
 Write-Success "Auto-update protections applied!"
 Write-Host ""
 
-# Reset overscan
+# Reset overscan + density. `wm overscan` was removed in Fire OS 8 / Android 11
+# so it no-ops there - harmless, Fire OS 6+ uses 100% of the screen by default.
 Write-Status "Configuring display settings..."
-Write-Host "    Resetting overscan to 100% (full screen)..."
-Invoke-Adb @("shell", "wm", "overscan", "0,0,0,0") | Out-Null
-Invoke-Adb @("shell", "wm", "overscan", "reset") | Out-Null
-Write-Host "    Resetting display density..."
-Invoke-Adb @("shell", "wm", "density", "reset") | Out-Null
+Invoke-Adb @("shell", "wm", "overscan", "0,0,0,0") 2>&1 | Out-Null
+Invoke-Adb @("shell", "wm", "overscan", "reset") 2>&1 | Out-Null
+Invoke-Adb @("shell", "wm", "density", "reset") 2>&1 | Out-Null
 Write-Success "Display settings configured!"
 Write-Host ""
 
@@ -308,10 +325,14 @@ Write-Host "  What's configured:"
 Write-Host "    * Moonode Launcher installed"
 Write-Host "    * Default launcher disabled"
 Write-Host "    * 'No Internet' warnings disabled"
-Write-Host "    * Screen set to always-on"
+Write-Host "    * Screen always-on (AOSP sleep + Fire OS screensaver + Energy Saver)"
 Write-Host "    * Display overscan reset (full screen)"
 Write-Host "    * Fire TV auto-updates suppressed (apps + forced OTAs)"
 Write-Host "    * HOME Guardian enabled + self-healing (via WRITE_SECURE_SETTINGS grant)"
+Write-Host ""
+Write-Warn "If the screen still goes black after ~4 hours of inactivity:"
+Write-Host "    Settings -> Preferences -> Power -> Energy Saver -> Off"
+Write-Host "  (Some Fire OS builds gate this behind the on-screen UI only.)"
 Write-Host ""
 Write-Host "  Next steps:"
 Write-Host "    1. Press the HOME button on your TV remote"

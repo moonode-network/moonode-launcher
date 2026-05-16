@@ -135,6 +135,17 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
     _webViewController = WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setBackgroundColor(const Color(0xFFFFFFFF)) // White background to match moonode.tv
+      // Native screen-rotation bridge intentionally NOT wired up: Fire OS does
+      // not honour setRequestedOrientation(PORTRAIT) by rotating the display;
+      // it letterboxes the activity into a portrait-shaped sub-window of the
+      // landscape panel, leaving SurfaceViews (video) full-screen landscape.
+      // Result is worse than CSS rotation: HTML rendered in a 607x1080 box
+      // with two black bars, with video bleeding through across the full
+      // 1920x1080. We keep the activity locked to landscape and let the web
+      // player handle rotation via CSS transforms instead. (The Kotlin
+      // setScreenOrientation method stays in place but unreachable from JS;
+      // it is harmless and lets us re-enable the bridge selectively in the
+      // future if Fire OS behaviour changes or for non-Fire-TV devices.)
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageStarted: (String url) {

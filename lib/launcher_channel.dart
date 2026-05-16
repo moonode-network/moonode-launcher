@@ -146,6 +146,26 @@ class LauncherChannel {
     return (result as num).toInt();
   }
 
+  /// Rotate the launcher activity natively at the OS level.
+  ///
+  /// Android WebView renders <video> and <iframe> via SurfaceView, which is
+  /// composited by the OS underneath the WebView's layer and ignores any CSS
+  /// `transform: rotate()` applied inside the page. Rotating the entire
+  /// activity surface via setRequestedOrientation makes every layer (HTML,
+  /// video, iframes, native views) rotate together — the only fully reliable
+  /// way to support portrait-mounted displays for video signage on Fire OS.
+  ///
+  /// The activity manifest declares full `configChanges`, so this does NOT
+  /// recreate the activity — the WebView keeps its state and moonode.tv
+  /// keeps playing during the rotation.
+  ///
+  /// Idempotent on the native side. Safe to call on every settings refresh.
+  ///
+  /// [angle] uses the signage CCW convention: 0, 90, 180, 270.
+  Future<void> setScreenOrientation(int angle) async {
+    await _methodChannel.invokeMethod('setScreenOrientation', angle);
+  }
+
   /// Stream of package change events
   Stream<Map<String, dynamic>> get packageEvents {
     return _eventChannel.receiveBroadcastStream().map((event) {

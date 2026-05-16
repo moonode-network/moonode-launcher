@@ -50,3 +50,8 @@ coverage/
 
 # Local artifact; GitHub rejects files > 100 MB
 build.zip
+
+# Prebuilt APK at repo root - used by setup-moonode-launcher.sh as a fast
+# path to skip the Flutter build when reinstalling on multiple sticks.
+# Not committed because release APKs are large and signed locally.
+moonode-launcher.apk

@@ -135,10 +135,26 @@ adb shell settings put global wifi_watchdog_on 0 >nul 2>&1
 echo   Offline mode configured!
 echo.
 
-REM Keep screen always on
-echo   Configuring kiosk settings...
+REM Kiosk power lockdown - disable all three Fire OS sleep/saver layers.
+echo   Configuring kiosk power lockdown...
+REM Layer 1: AOSP inactivity sleep
 adb shell settings put system screen_off_timeout 2147483647 >nul 2>&1
-echo   Kiosk settings configured!
+REM Layer 2: Fire OS screensaver / DayDream
+adb shell settings put secure screensaver_enabled 0 >nul 2>&1
+adb shell settings put secure screensaver_activate_on_sleep 0 >nul 2>&1
+adb shell settings put secure screensaver_activate_on_dock 0 >nul 2>&1
+adb shell settings put secure sleep_timeout 0 >nul 2>&1
+adb shell settings put system sleep_timeout 0 >nul 2>&1
+adb shell settings put secure screensaver_activate_after_tv_off 0 >nul 2>&1
+REM Layer 3: Amazon Energy Saver / 4h auto-off
+adb shell settings put global stay_on_while_plugged_in 7 >nul 2>&1
+adb shell settings put global low_power 0 >nul 2>&1
+adb shell settings put global low_power_trigger_level 0 >nul 2>&1
+adb shell settings put secure amazon_energy_saver_enabled 0 >nul 2>&1
+adb shell settings put secure amazon_inactivity_sleep_enabled 0 >nul 2>&1
+adb shell settings put secure inactivity_sleep_timeout 0 >nul 2>&1
+adb shell pm disable-user --user 0 com.amazon.tv.ecomode >nul 2>&1
+echo   Kiosk power lockdown applied!
 echo.
 
 REM Reduce memory pressure on low-RAM Fire TV Sticks. Safe on Android TV

@@ -174,6 +174,11 @@ class MainActivity : FlutterActivity() {
                     result.success(true)
                 }
                 "homeHijackPauseRemainingMs" -> result.success(HomeHijackService.pauseRemainingMs())
+                "setScreenOrientation" -> {
+                    val angle = (call.arguments as? Number)?.toInt() ?: 0
+                    setScreenOrientation(angle)
+                    result.success(true)
+                }
                 else -> throw IllegalArgumentException()
             }
         }
@@ -489,6 +494,68 @@ class MainActivity : FlutterActivity() {
                 true
             } catch (e2: Exception) {
                 false
+            }
+        }
+    }
+
+    /**
+     * Rotate the activity surface natively at the OS level.
+     *
+     * Why this exists
+     * ---------------
+     * Android WebView renders <video> and <iframe> via SurfaceView, which is
+     * composited by the OS underneath the WebView's normal layer. CSS
+     * `transform: rotate()` applied in moonode.tv (the embedded web player)
+     * only rotates the WebView's HTML layer - SurfaceViews stay in the panel's
+     * native landscape orientation. Result: on a portrait-mounted TV the HTML
+     * looks correct but every video / YouTube / Vimeo iframe bleeds through
+     * sideways. This is especially visible on Fire OS WebView (Chromium older
+     * than current Stable, where TextureView fallback isn't automatic).
+     *
+     * Calling setRequestedOrientation rotates the entire activity surface at
+     * the OS level. The WebView, every SurfaceView inside it, and any future
+     * native view all rotate together - so video, iframes and HTML are
+     * visually consistent on portrait-mounted TVs.
+     *
+     * The activity manifest declares the full configChanges set so the
+     * activity is NOT recreated on rotation; the WebView keeps its state and
+     * the player does not reload.
+     *
+     * Idempotency
+     * -----------
+     * Skips the system call when the requested orientation already matches.
+     * The web player calls this on every settings refresh (every few minutes)
+     * and we don't want a no-op orientation change to trigger any
+     * onConfigurationChanged side effects.
+     *
+     * Mapping (signage convention, counter-clockwise from landscape):
+     *   0   -> SCREEN_ORIENTATION_LANDSCAPE          (default; HDMI native)
+     *   90  -> SCREEN_ORIENTATION_PORTRAIT           (TV mounted with right edge up)
+     *   180 -> SCREEN_ORIENTATION_REVERSE_LANDSCAPE  (TV upside down)
+     *   270 -> SCREEN_ORIENTATION_REVERSE_PORTRAIT   (TV mounted with left edge up)
+     *   any other value -> SCREEN_ORIENTATION_LANDSCAPE (safe default)
+     */
+    private fun setScreenOrientation(angle: Int) {
+        val target = when (angle) {
+            90 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
+            270 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
+            else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+        }
+        runOnUiThread {
+            try {
+                if (requestedOrientation != target) {
+                    requestedOrientation = target
+                    android.util.Log.i(
+                        "MoonodeLauncher",
+                        "setScreenOrientation: applied target=$target for angle=$angle"
+                    )
+                }
+            } catch (e: Exception) {
+                android.util.Log.w(
+                    "MoonodeLauncher",
+                    "setScreenOrientation failed for angle $angle: ${e.message}"
+                )
             }
         }
     }

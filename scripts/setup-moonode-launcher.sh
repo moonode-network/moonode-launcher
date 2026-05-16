@@ -219,11 +219,72 @@ $ADB_CMD shell settings put global wifi_watchdog_on 0 2>/dev/null || true
 echo -e "${GREEN}Offline mode configured!${NC}"
 echo ""
 
-# Optional: Keep screen always on for kiosk mode
-echo -e "${BLUE}Configuring kiosk settings...${NC}"
-echo "  Setting screen to never turn off..."
+# =============================================================================
+# Kiosk power lockdown: keep the display lit 24/7 for digital signage.
+#
+# Fire TV has THREE independent power-management layers and you must disable
+# all three. AOSP screen_off_timeout alone is NOT enough on Fire OS.
+#
+#   1) AOSP inactivity sleep      (system.screen_off_timeout)
+#   2) Fire OS DayDream/screensaver photo carousel
+#      (secure.screensaver_*, secure.sleep_timeout)
+#   3) Amazon "Energy Saver" 4h auto-shutoff
+#      (com.amazon.tv.devicecontrolsettings + EcoMode service)
+#
+# Layers 1+2 are 100% automatable via ADB. Layer 3 (the 4-hour off) is a
+# closed Amazon service. We do best-effort here: stay_on_while_plugged_in=7
+# tells the framework the device is "always charging" which on most Fire OS
+# builds bypasses the Eco-mode timer entirely. If it doesn't take on a
+# particular Fire OS version, the manual UI toggle is:
+#   Settings -> Preferences -> Power -> Energy Saver -> Off
+# (also called "Sleep Timer" on some builds).
+# =============================================================================
+echo -e "${BLUE}Configuring kiosk power lockdown...${NC}"
+
+# --- Layer 1: AOSP inactivity sleep ------------------------------------------
+# Set to maximum (~24.8 days). 2147483647 = Int32 max ms.
 $ADB_CMD shell settings put system screen_off_timeout 2147483647 2>/dev/null || true
-echo -e "${GREEN}Kiosk settings configured!${NC}"
+
+# --- Layer 2: Fire OS screensaver / DayDream ---------------------------------
+# These are the keys that control the "Your photos in a slideshow" carousel
+# that appears after a few minutes of inactivity on Fire TV.
+$ADB_CMD shell settings put secure screensaver_enabled 0 2>/dev/null || true
+$ADB_CMD shell settings put secure screensaver_activate_on_sleep 0 2>/dev/null || true
+$ADB_CMD shell settings put secure screensaver_activate_on_dock 0 2>/dev/null || true
+# sleep_timeout = how long until Fire OS goes from active to screensaver.
+# -1 / 0 = never on most builds; we set both to be safe across Fire OS 5/6/7.
+$ADB_CMD shell settings put secure sleep_timeout 0 2>/dev/null || true
+$ADB_CMD shell settings put system sleep_timeout 0 2>/dev/null || true
+# Some Fire OS builds expose a separate "ambient" / "after_TV_off" screensaver.
+$ADB_CMD shell settings put secure screensaver_activate_after_tv_off 0 2>/dev/null || true
+
+# --- Layer 3: Amazon "Energy Saver" / 4h auto-off ----------------------------
+# Tell the framework the device is always plugged into AC | USB | Wireless
+# (mask 7). On most Fire OS versions this short-circuits the Eco-mode timer
+# because the OS thinks it's a permanently-powered appliance, not a remote-
+# controlled set-top box that the user "walked away from".
+$ADB_CMD shell settings put global stay_on_while_plugged_in 7 2>/dev/null || true
+# Fire OS 6+ stores the Energy Saver toggle under several different keys
+# depending on build. We try all of them - the ones that don't exist no-op.
+$ADB_CMD shell settings put global low_power 0 2>/dev/null || true
+$ADB_CMD shell settings put global low_power_trigger_level 0 2>/dev/null || true
+# Amazon-internal toggles seen on Fire OS 7 (AFTKAUK / AFTKA Plus / AFTKMST12):
+$ADB_CMD shell settings put secure amazon_energy_saver_enabled 0 2>/dev/null || true
+$ADB_CMD shell settings put secure amazon_inactivity_sleep_enabled 0 2>/dev/null || true
+$ADB_CMD shell settings put secure inactivity_sleep_timeout 0 2>/dev/null || true
+# As a last-resort hammer on Fire OS builds that expose it, kill the watchdog
+# job entirely. Safe no-op if the package doesn't exist on this build.
+$ADB_CMD shell pm disable-user --user 0 com.amazon.tv.ecomode 2>/dev/null || true
+
+# --- Verify layer 1 took ----------------------------------------------------
+CURRENT_TIMEOUT=$($ADB_CMD shell settings get system screen_off_timeout 2>/dev/null | tr -d '\r\n')
+if [ "$CURRENT_TIMEOUT" = "2147483647" ]; then
+    echo -e "${GREEN}Kiosk power lockdown applied!${NC}"
+else
+    echo -e "${YELLOW}Warning: screen_off_timeout = $CURRENT_TIMEOUT (expected 2147483647)${NC}"
+    echo -e "${YELLOW}You may need to also disable Energy Saver manually:${NC}"
+    echo -e "${YELLOW}  Settings -> Preferences -> Power -> Energy Saver -> Off${NC}"
+fi
 echo ""
 
 # Fire TV / Fire OS specific: lock down auto-updates so the OS does not silently
@@ -283,14 +344,15 @@ fi
 echo -e "${GREEN}Auto-update protections applied!${NC}"
 echo ""
 
-# Reset overscan to use full screen (no cropping)
+# Reset overscan + display density to defaults so Moonode covers the full
+# screen. NOTE: `wm overscan` was removed in Android 11 / Fire OS 8, so on
+# newer sticks these calls print "Unknown command: overscan" and no-op.
+# That's harmless - Fire OS 6+ always uses 100% of the screen anyway. We
+# silence the chatter on stderr so the install output stays clean.
 echo -e "${BLUE}Configuring display settings...${NC}"
-echo "  Resetting overscan to 100% (full screen)..."
-$ADB_CMD shell wm overscan 0,0,0,0 2>/dev/null || true
-$ADB_CMD shell wm overscan reset 2>/dev/null || true
-# Also try setting display density to default
-echo "  Resetting display density..."
-$ADB_CMD shell wm density reset 2>/dev/null || true
+$ADB_CMD shell wm overscan 0,0,0,0 >/dev/null 2>&1 || true
+$ADB_CMD shell wm overscan reset >/dev/null 2>&1 || true
+$ADB_CMD shell wm density reset >/dev/null 2>&1 || true
 echo -e "${GREEN}Display settings configured!${NC}"
 echo ""
 
@@ -313,10 +375,14 @@ echo "What's configured:"
 echo "  ✓ Moonode Launcher installed"
 echo "  ✓ Default launcher disabled"
 echo "  ✓ 'No Internet' warnings disabled"
-echo "  ✓ Screen set to always-on"
+echo "  ✓ Screen always-on (AOSP sleep + Fire OS screensaver + Energy Saver)"
 echo "  ✓ Display overscan reset (full screen)"
 echo "  ✓ Fire TV auto-updates suppressed (apps + forced OTAs)"
 echo "  ✓ HOME Guardian enabled + self-healing (via WRITE_SECURE_SETTINGS grant)"
+echo ""
+echo -e "${YELLOW}If the screen still goes black after ~4 hours of inactivity:${NC}"
+echo "    Settings → Preferences → Power → Energy Saver → Off"
+echo "  (Some Fire OS builds gate this behind the on-screen UI only.)"
 echo ""
 echo "Next steps:"
 echo "  1. Press the HOME button on your TV remote"
