@@ -3,12 +3,24 @@
 # Moonode Launcher Setup Script
 # This script installs and configures Moonode Launcher as the default HOME screen
 #
-# Usage: ./setup-moonode-launcher.sh [DEVICE_IP[:PORT]]
+# Usage: ./setup-moonode-launcher.sh [--soft] [--lockdown] [DEVICE_IP[:PORT]]
+#
+# Flags:
+#   --soft          NEVER disable the stock launcher. Use the system HOME
+#                   picker so Moonode is selected as default but the original
+#                   launcher remains available as a fallback. Auto-enabled on
+#                   Xiaomi MiTV / MIUI builds.
+#   --lockdown      After Moonode is verified running, disable the stock
+#                   Google TV launcher packages so Moonode wins HOME. On
+#                   Xiaomi, MIUI re-enables them on reboot - pair this with
+#                   a BootReceiver build that retries launching Moonode on boot.
 #
 # Examples:
-#   ./setup-moonode-launcher.sh                    # Use USB connection
-#   ./setup-moonode-launcher.sh 192.168.1.100     # Connect via WiFi (default port 5555)
-#   ./setup-moonode-launcher.sh 192.168.1.100:5555 # Connect via WiFi (explicit port)
+#   ./setup-moonode-launcher.sh                          # USB connection
+#   ./setup-moonode-launcher.sh 192.168.1.100            # Connect via WiFi
+#   ./setup-moonode-launcher.sh 192.168.1.100:5555       # Explicit port
+#   ./setup-moonode-launcher.sh --soft 192.168.1.100     # Safe mode (Xiaomi)
+#   ./setup-moonode-launcher.sh --lockdown 172.20.10.2   # Xiaomi: make Moonode HOME
 #
 
 set -e
@@ -49,9 +61,34 @@ if ! adb devices &>/dev/null; then
     fi
 fi
 
-# Parse IP and optional port
-DEVICE_IP="$1"
+# Parse flags + IP + optional port. Flags can appear before or after the IP.
+SOFT_MODE=0
+LOCKDOWN_MODE=0
+DEVICE_IP=""
 DEVICE_PORT="5555"
+SOFT_MODE_REASON=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --soft)
+            SOFT_MODE=1
+            SOFT_MODE_REASON="--soft flag passed"
+            ;;
+        --lockdown)
+            LOCKDOWN_MODE=1
+            ;;
+        --help|-h)
+            sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            if [ -z "$DEVICE_IP" ]; then
+                DEVICE_IP="$arg"
+            fi
+            ;;
+    esac
+done
+
 if [ -n "$DEVICE_IP" ]; then
     # Check if port is included in IP (format: IP:PORT)
     if [[ "$DEVICE_IP" == *:* ]]; then
@@ -145,6 +182,132 @@ echo "Device: $DEVICE_MODEL"
 echo "Android: $ANDROID_VERSION"
 echo ""
 
+# =============================================================================
+# Device-type detection.
+#
+# Fire TV and Android TV / Google TV behave very differently and the rest of
+# the script branches off this:
+#
+#   Fire TV (Amazon)
+#     - Amazon protects its stock launcher; the standard Android HOME picker
+#       does not work. We have to pm disable-user the Amazon launcher and
+#       enable the HOME Guardian accessibility service.
+#     - Fire OS has Amazon-specific energy-saver / forced-OTA daemons that
+#       need extra lockdown.
+#
+#   Android TV / Google TV (TCL, Sony, Hisense, Xiaomi, plain GTV, etc.)
+#     - The OS has a working HOME activity API (cmd package set-home-activity)
+#       so we try the clean path first.
+#     - Google Backdrop ambient-dream activity overlays everything ~5s after
+#       boot. If we don't kill it the operator sees a black screen and
+#       assumes the install bricked the TV.
+#     - Fire OS daemons / HOME Guardian don't exist on these builds, so we
+#       skip them.
+#
+# Detection is "is this Amazon?" because Amazon is the lone exception. Every
+# other OEM (and plain AOSP TV) gets the ATV path.
+# =============================================================================
+echo -e "${BLUE}Detecting device type...${NC}"
+MANUFACTURER=$($ADB_CMD shell getprop ro.product.manufacturer 2>/dev/null | tr -d '\r')
+BRAND=$($ADB_CMD shell getprop ro.product.brand 2>/dev/null | tr -d '\r')
+MFR_LC=$(echo "$MANUFACTURER" | tr '[:upper:]' '[:lower:]')
+BRAND_LC=$(echo "$BRAND" | tr '[:upper:]' '[:lower:]')
+HAS_AMAZON_LAUNCHER=$($ADB_CMD shell pm list packages 2>/dev/null | grep -c '^package:com\.amazon\.tv\.launcher$' || true)
+HAS_AMAZON_LAUNCHER=${HAS_AMAZON_LAUNCHER:-0}
+
+IS_FIRETV=0
+IS_ATV=0
+IS_XIAOMI=0
+if [ "$MFR_LC" = "amazon" ] || [ "$BRAND_LC" = "amazon" ] || [ "$HAS_AMAZON_LAUNCHER" -gt 0 ]; then
+    IS_FIRETV=1
+    DEVICE_KIND="Fire TV"
+else
+    IS_ATV=1
+    DEVICE_KIND="Android TV / Google TV"
+fi
+if [ "$MFR_LC" = "xiaomi" ] || [ "$BRAND_LC" = "xiaomi" ] || echo "$DEVICE_MODEL" | grep -qiE '(mitv|mi tv|mibox|mi box)'; then
+    IS_XIAOMI=1
+    DEVICE_KIND="$DEVICE_KIND (Xiaomi)"
+fi
+echo -e "${GREEN}Detected: $DEVICE_KIND${NC}"
+
+# Xiaomi MiTV / MIUI does not honour `cmd package set-home-activity` and
+# silently fails to promote a third-party HOME activity. The fallback path
+# (pm disable-user on the stock launcher) leaves the device with no HOME
+# resolver after a reboot, producing a black screen with no remote
+# affordance. Force --soft on Xiaomi unconditionally; the user can still
+# pick Moonode through the system HOME picker.
+if [ "$IS_XIAOMI" -eq 1 ] && [ "$SOFT_MODE" -ne 1 ]; then
+    SOFT_MODE=1
+    SOFT_MODE_REASON="Xiaomi auto-detected"
+    echo -e "${YELLOW}Xiaomi device → forcing --soft mode (stock launcher will be left enabled).${NC}"
+fi
+
+if [ "$SOFT_MODE" -eq 1 ]; then
+    echo -e "${YELLOW}Soft mode active ($SOFT_MODE_REASON): stock launcher will NOT be disabled.${NC}"
+fi
+echo ""
+
+# ---------------------------------------------------------------------------
+# HOME detection helpers.
+#
+# On most Android TV builds, `cmd package resolve-activity` is the source of
+# truth. Xiaomi MiTV (Android 14) is different: the operator's HOME picker
+# selection is stored in the RoleManager (`android.app.role.HOME` →
+# holders=com.moonode.launcher) but resolve-activity keeps returning the
+# priv-app Google launcher. We must check BOTH or the soft-mode poll loop
+# never exits even after a correct remote selection.
+# ---------------------------------------------------------------------------
+get_resolved_home() {
+    $ADB_CMD shell cmd package resolve-activity \
+        -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null \
+        | grep packageName | head -1 | cut -d'=' -f2 | tr -d '\r'
+}
+
+get_home_role_holder() {
+    $ADB_CMD shell dumpsys role 2>/dev/null \
+        | grep -A2 'android.app.role.HOME' \
+        | grep 'holders=' | head -1 \
+        | sed 's/.*holders=//' | tr -d '\r'
+}
+
+moonode_is_default_home() {
+    local resolved role_holder
+    resolved=$(get_resolved_home)
+    if [ "$resolved" = "com.moonode.launcher" ]; then
+        NEW_HOME="com.moonode.launcher"
+        return 0
+    fi
+    role_holder=$(get_home_role_holder)
+    if [ "$role_holder" = "com.moonode.launcher" ]; then
+        NEW_HOME="com.moonode.launcher"
+        return 0
+    fi
+    NEW_HOME="$resolved"
+    return 1
+}
+
+# =============================================================================
+# Captive-portal probe off - BEFORE install.
+#
+# On Google-certified Android TV / Google TV the first network request the
+# WebView makes when Moonode launches (loading moonode.tv) is intercepted by
+# Android's captive-portal probe. That intercept blocks the Service Worker
+# registration on first run, so the launcher's Cache Storage stays empty.
+# On the NEXT reboot the device boots offline (or the SW reads stale state)
+# and shows "offline content unavailable".
+#
+# Doing this BEFORE the launcher's first network touch removes that race.
+# On Fire TV the same commands are a no-op cost (Fire OS doesn't run the
+# same probe anyway), so it's safe to do unconditionally and early.
+# =============================================================================
+echo -e "${BLUE}Disabling captive-portal probe (so the Service Worker can cache)...${NC}"
+$ADB_CMD shell settings put global captive_portal_mode 0 2>/dev/null || true
+$ADB_CMD shell settings put global captive_portal_detection_enabled 0 2>/dev/null || true
+$ADB_CMD shell settings put global wifi_watchdog_on 0 2>/dev/null || true
+echo -e "${GREEN}Captive-portal probe disabled.${NC}"
+echo ""
+
 # Check if APK exists
 APK_PATH="./moonode-launcher.apk"
 if [ ! -f "$APK_PATH" ]; then
@@ -177,47 +340,151 @@ $ADB_CMD shell pm grant com.moonode.launcher android.permission.WRITE_SECURE_SET
     echo -e "${YELLOW}Could not grant WRITE_SECURE_SETTINGS - HOME Guardian will need manual re-enable if Fire OS disables it${NC}"
 echo ""
 
-# Detect current default launcher
+# Detect current default launcher (informational on ATV, action target on Fire TV)
 echo -e "${BLUE}Detecting current launcher...${NC}"
 CURRENT_LAUNCHER=$($ADB_CMD shell cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME | grep packageName | head -1 | cut -d'=' -f2 | tr -d '\r')
 echo "Current launcher: $CURRENT_LAUNCHER"
 echo ""
 
-# Known launcher packages to disable
-LAUNCHERS_TO_DISABLE=(
-    "com.google.android.apps.tv.launcherx"        # Google TV
-    "com.google.android.tvlauncher"               # Android TV
-    "com.google.android.leanbacklauncher"         # Older Android TV
-    "com.google.android.tungsten.setupwraith"     # Google TV fallback
-    "com.amazon.tv.launcher"                       # Fire TV
-)
+if [ "$IS_FIRETV" -eq 1 ]; then
+    # -------------------------------------------------------------------------
+    # Fire TV path: brute-force HOME by disabling every known Amazon launcher.
+    # This is the only reliable way on Fire OS because Amazon bypasses the
+    # standard Android HOME picker.
+    # -------------------------------------------------------------------------
+    LAUNCHERS_TO_DISABLE=(
+        "com.amazon.tv.launcher"
+        "com.amazon.firehomestarter"
+        "com.amazon.firelauncher"
+        "com.amazon.tv.leanbacklauncher"
+        "com.amazon.tv.leanbacklauncher.widget"
+    )
 
-# Disable known launchers
-echo -e "${BLUE}Disabling default launchers...${NC}"
-for launcher in "${LAUNCHERS_TO_DISABLE[@]}"; do
-    if $ADB_CMD shell pm list packages | grep -q "$launcher"; then
-        echo "  Disabling $launcher..."
-        $ADB_CMD shell pm disable-user --user 0 "$launcher" 2>/dev/null || true
+    echo -e "${BLUE}Disabling Amazon launchers...${NC}"
+    for launcher in "${LAUNCHERS_TO_DISABLE[@]}"; do
+        if $ADB_CMD shell pm list packages | grep -q "$launcher"; then
+            echo "  Disabling $launcher..."
+            $ADB_CMD shell pm disable-user --user 0 "$launcher" 2>/dev/null || true
+        fi
+    done
+
+    # Also disable whatever the current resolver is pointing at, in case the
+    # device ships a launcher we didn't list above.
+    if [ -n "$CURRENT_LAUNCHER" ] && [ "$CURRENT_LAUNCHER" != "com.moonode.launcher" ]; then
+        echo "  Disabling current launcher $CURRENT_LAUNCHER..."
+        $ADB_CMD shell pm disable-user --user 0 "$CURRENT_LAUNCHER" 2>/dev/null || true
     fi
-done
 
-# Also disable the detected current launcher if different
-if [ -n "$CURRENT_LAUNCHER" ] && [ "$CURRENT_LAUNCHER" != "com.moonode.launcher" ]; then
-    echo "  Disabling $CURRENT_LAUNCHER..."
-    $ADB_CMD shell pm disable-user --user 0 "$CURRENT_LAUNCHER" 2>/dev/null || true
+    echo -e "${GREEN}Amazon launchers disabled!${NC}"
+    echo ""
+else
+    # -------------------------------------------------------------------------
+    # Android TV / Google TV path: try the clean OS API first, fall back to
+    # disabling the stock launcher only if needed.
+    #
+    # Step 1: Kill Google Backdrop. The ambient/dream activity overlays the
+    #         entire screen ~5s after boot on TCL / Google TV builds and looks
+    #         identical to a black-screen brick to operators.
+    # Step 2: Clear preferred-activity associations so the HOME resolver will
+    #         actually re-evaluate.
+    # Step 3: Try cmd package set-home-activity. This is the supported API
+    #         path and works silently on many builds. On Google-certified TVs
+    #         it sometimes does nothing - that's why we verify afterwards.
+    # Step 4: If verify still resolves to the stock launcher, disable it with
+    #         pm disable-user --user 0. This is what actually worked on the
+    #         TCL AT11 we hardened.
+    # -------------------------------------------------------------------------
+    echo -e "${BLUE}Disabling Google Backdrop ambient dream (prevents black-screen-after-boot)...${NC}"
+    $ADB_CMD shell am force-stop com.google.android.backdrop 2>/dev/null || true
+    $ADB_CMD shell pm disable-user --user 0 com.google.android.backdrop 2>/dev/null || true
+    echo -e "${GREEN}Backdrop dream disabled.${NC}"
+    echo ""
+
+    echo -e "${BLUE}Setting Moonode as HOME (clean path)...${NC}"
+    $ADB_CMD shell pm clear-preferred-activities com.google.android.tvlauncher 2>/dev/null || true
+    $ADB_CMD shell pm clear-preferred-activities com.google.android.apps.tv.launcherx 2>/dev/null || true
+    $ADB_CMD shell pm clear-preferred-activities com.moonode.launcher 2>/dev/null || true
+    $ADB_CMD shell cmd package set-home-activity com.moonode.launcher/com.moonode.launcher.MainActivity 2>/dev/null || true
+
+    NEW_HOME=$($ADB_CMD shell cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null | grep packageName | head -1 | cut -d'=' -f2 | tr -d '\r')
+    if [ "$NEW_HOME" = "com.moonode.launcher" ]; then
+        echo -e "${GREEN}HOME = com.moonode.launcher (clean API path worked).${NC}"
+    elif [ "$SOFT_MODE" -eq 1 ]; then
+        # Soft mode: the stock launcher stays enabled. We open the system
+        # HOME picker on the TV so the operator selects Moonode manually.
+        # If they ever need to recover (Moonode crashes, content fails), a
+        # single press of HOME re-shows the picker and they can swap back.
+        echo -e "${YELLOW}HOME still = $NEW_HOME after set-home-activity.${NC}"
+        echo -e "${BLUE}Soft mode: opening the system HOME picker on the TV...${NC}"
+        $ADB_CMD shell am start -a android.settings.HOME_SETTINGS >/dev/null 2>&1 || true
+        sleep 1
+        echo ""
+        echo -e "${YELLOW}>>> ON THE TV: pick 'Moonode Launcher' as the default home app. <<<${NC}"
+        echo "    (Use the remote arrows + OK button.)"
+        echo ""
+        # Wait for the operator's pick. Two modes:
+        #   - TTY (operator at a terminal): also accept ENTER as an early
+        #     "I'm done" signal so they don't have to wait for the poll.
+        #   - non-TTY (script piped / run by another tool): just poll the
+        #     resolver, no input expected.
+        # In both cases we time-box the wait at 90s and report what we see.
+        echo "    Polling for Moonode HOME selection (up to 90s)..."
+        echo "    (On Xiaomi, press ENTER here once you've picked Moonode on the TV.)"
+        WAITED=0
+        MOONODE_HOME_OK=0
+        while [ "$WAITED" -lt 90 ]; do
+            if moonode_is_default_home; then
+                MOONODE_HOME_OK=1
+                break
+            fi
+            if [ -t 0 ] && read -r -t 1 _ 2>/dev/null; then
+                if moonode_is_default_home; then
+                    MOONODE_HOME_OK=1
+                fi
+                break
+            else
+                sleep 1
+            fi
+            WAITED=$((WAITED + 1))
+        done
+        if [ "$MOONODE_HOME_OK" -eq 1 ]; then
+            if [ "$IS_XIAOMI" -eq 1 ] && [ "$(get_resolved_home)" != "com.moonode.launcher" ]; then
+                echo -e "${GREEN}HOME role = com.moonode.launcher (Xiaomi picker accepted).${NC}"
+                echo -e "${YELLOW}Note: Xiaomi may still show Google TV on HOME press; Moonode launches on boot.${NC}"
+                $ADB_CMD shell am start -n com.moonode.launcher/com.moonode.launcher.MainActivity >/dev/null 2>&1 || true
+            else
+                echo -e "${GREEN}HOME = com.moonode.launcher (HOME picker selection accepted).${NC}"
+            fi
+        else
+            echo -e "${YELLOW}HOME still = $NEW_HOME. Moonode is INSTALLED but not yet the default.${NC}"
+            echo -e "${YELLOW}You can finish later from the TV UI:${NC}"
+            echo "    Settings → Apps → Default apps → Home app → Moonode Launcher"
+            echo -e "${YELLOW}Stock launcher remains enabled - device is safe to reboot.${NC}"
+        fi
+    else
+        echo -e "${YELLOW}HOME still = $NEW_HOME after set-home-activity.${NC}"
+        echo -e "${YELLOW}Falling back to pm disable-user on the stock launcher...${NC}"
+        for launcher in \
+            "com.google.android.tvlauncher" \
+            "com.google.android.apps.tv.launcherx" \
+            "com.google.android.leanbacklauncher" \
+            "com.google.android.tungsten.setupwraith"; do
+            if $ADB_CMD shell pm list packages | grep -q "$launcher"; then
+                echo "  Disabling $launcher..."
+                $ADB_CMD shell pm disable-user --user 0 "$launcher" 2>/dev/null || true
+            fi
+        done
+        NEW_HOME=$($ADB_CMD shell cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME 2>/dev/null | grep packageName | head -1 | cut -d'=' -f2 | tr -d '\r')
+        if [ "$NEW_HOME" = "com.moonode.launcher" ]; then
+            echo -e "${GREEN}HOME = com.moonode.launcher (fallback path worked).${NC}"
+        else
+            echo -e "${RED}HOME still = $NEW_HOME after fallback. Manual step required:${NC}"
+            echo "    adb shell am start -a android.settings.HOME_SETTINGS"
+            echo "  Then pick Moonode Launcher with the remote."
+        fi
+    fi
+    echo ""
 fi
-
-echo -e "${GREEN}Default launchers disabled!${NC}"
-echo ""
-
-# Disable captive portal detection (prevents "No Internet" warnings)
-echo -e "${BLUE}Configuring offline mode...${NC}"
-echo "  Disabling 'WiFi has no internet' warnings..."
-$ADB_CMD shell settings put global captive_portal_mode 0 2>/dev/null || true
-$ADB_CMD shell settings put global captive_portal_detection_enabled 0 2>/dev/null || true
-$ADB_CMD shell settings put global wifi_watchdog_on 0 2>/dev/null || true
-echo -e "${GREEN}Offline mode configured!${NC}"
-echo ""
 
 # =============================================================================
 # Kiosk power lockdown: keep the display lit 24/7 for digital signage.
@@ -287,59 +554,60 @@ else
 fi
 echo ""
 
-# Fire TV / Fire OS specific: lock down auto-updates so the OS does not silently
-# re-enable Amazon launcher packages, push OS updates that change behaviour, or
-# pull APK updates from the Appstore overnight. Safe to run on Android TV too -
-# the package commands fail silently when the package does not exist.
-# Enable the HOME Guardian accessibility service immediately. The launcher
-# will also self-heal it on subsequent starts via WRITE_SECURE_SETTINGS, but
-# enabling it here guarantees HOME button protection is live from the very
-# first boot - no need to wait for the user to open Moonode.
-echo -e "${BLUE}Enabling HOME Guardian accessibility service...${NC}"
-HIJACK_COMPONENT="com.moonode.launcher/com.moonode.launcher.HomeHijackService"
-EXISTING_SVCS=$($ADB_CMD shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r\n')
-if [ -z "$EXISTING_SVCS" ] || [ "$EXISTING_SVCS" = "null" ]; then
-    NEW_SVCS="$HIJACK_COMPONENT"
-elif echo "$EXISTING_SVCS" | grep -q "$HIJACK_COMPONENT"; then
-    NEW_SVCS="$EXISTING_SVCS"
-else
-    NEW_SVCS="$EXISTING_SVCS:$HIJACK_COMPONENT"
+# HOME Guardian: Fire-TV-only.
+#
+# This accessibility service watches for Amazon HOME packages winning a focus
+# race (Amazon re-launches its launcher silently after some events) and
+# re-fires Moonode. It targets Amazon package names exclusively, so on
+# Android TV / Google TV it would do nothing useful but still show as an
+# enabled accessibility service in Settings - which spooks operators. Skip
+# it on ATV.
+if [ "$IS_FIRETV" -eq 1 ]; then
+    echo -e "${BLUE}Enabling HOME Guardian accessibility service (Fire TV)...${NC}"
+    HIJACK_COMPONENT="com.moonode.launcher/com.moonode.launcher.HomeHijackService"
+    EXISTING_SVCS=$($ADB_CMD shell settings get secure enabled_accessibility_services 2>/dev/null | tr -d '\r\n')
+    if [ -z "$EXISTING_SVCS" ] || [ "$EXISTING_SVCS" = "null" ]; then
+        NEW_SVCS="$HIJACK_COMPONENT"
+    elif echo "$EXISTING_SVCS" | grep -q "$HIJACK_COMPONENT"; then
+        NEW_SVCS="$EXISTING_SVCS"
+    else
+        NEW_SVCS="$EXISTING_SVCS:$HIJACK_COMPONENT"
+    fi
+    $ADB_CMD shell settings put secure enabled_accessibility_services "$NEW_SVCS" 2>/dev/null || true
+    $ADB_CMD shell settings put secure accessibility_enabled 1 2>/dev/null || true
+    echo -e "${GREEN}HOME Guardian enabled!${NC}"
+    echo ""
 fi
-$ADB_CMD shell settings put secure enabled_accessibility_services "$NEW_SVCS" 2>/dev/null || true
-$ADB_CMD shell settings put secure accessibility_enabled 1 2>/dev/null || true
-echo -e "${GREEN}HOME Guardian enabled!${NC}"
-echo ""
 
-# Best-effort: reduce memory pressure on low-RAM Fire TV Sticks (~921 MB
-# total) by disabling non-essential Amazon background daemons. Most of these
-# are protected packages on current Fire OS builds and the disable will
-# silently fail - that's fine, the launcher's own onTrimMemory + cold-start
-# auto-recovery handles the rest. Older Fire OS builds may allow these to
-# be disabled, in which case this frees ~50-80 MB.
-MEMORY_HOG_PACKAGES=(
-    "com.amazon.client.metrics"          # Minerva analytics
-    "com.amazon.device.messaging"        # Cloud push notifications
-    "com.amazon.tv.parentalcontrols"     # Parental controls UI
-    "com.amazon.diode"                   # External event collector
-)
-for pkg in "${MEMORY_HOG_PACKAGES[@]}"; do
-    $ADB_CMD shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1 || true
-done
+# Fire-TV-only: reduce memory pressure on low-RAM Fire TV Sticks (~921 MB
+# total) by disabling non-essential Amazon background daemons. These packages
+# do not exist on Android TV / Google TV, so we skip the loop entirely there
+# to keep the install output clean.
+if [ "$IS_FIRETV" -eq 1 ]; then
+    MEMORY_HOG_PACKAGES=(
+        "com.amazon.client.metrics"          # Minerva analytics
+        "com.amazon.device.messaging"        # Cloud push notifications
+        "com.amazon.tv.parentalcontrols"     # Parental controls UI
+        "com.amazon.diode"                   # External event collector
+    )
+    for pkg in "${MEMORY_HOG_PACKAGES[@]}"; do
+        $ADB_CMD shell pm disable-user --user 0 "$pkg" >/dev/null 2>&1 || true
+    done
+fi
 
 
-echo -e "${BLUE}Locking down auto-updates (Fire TV protections)...${NC}"
-# 1) Tell the Appstore not to auto-download app updates in the background.
+# Auto-update lockdown.
+# The two `settings put global` keys are generic AOSP and useful on both
+# platforms. The Amazon forced-OTA disable is Fire-TV-only because the
+# package does not exist on Android TV.
+echo -e "${BLUE}Locking down auto-updates...${NC}"
 $ADB_CMD shell settings put global app_auto_download 0 2>/dev/null || true
-# 2) Honour the AOSP-style flag some Fire OS builds respect for OTAs.
 $ADB_CMD shell settings put global ota_disable_automatic_update 1 2>/dev/null || true
-# 3) Disable Amazon's "forced OTA updater" package - this is the daemon that
-#    aggressively pushes Fire OS system updates. It is NOT a protected package
-#    so disable-user works. The core OTA service (com.amazon.device.software.ota)
-#    cannot be disabled without root, but without the forced updater Fire OS
-#    will not push updates aggressively in the background.
-if $ADB_CMD shell pm list packages | grep -q "com.amazon.tv.forcedotaupdater.v2"; then
-    echo "  Disabling Amazon forced OTA updater..."
-    $ADB_CMD shell pm disable-user --user 0 com.amazon.tv.forcedotaupdater.v2 2>/dev/null || true
+if [ "$IS_FIRETV" -eq 1 ]; then
+    if $ADB_CMD shell pm list packages | grep -q "com.amazon.tv.forcedotaupdater.v2"; then
+        echo "  Disabling Amazon forced OTA updater..."
+        $ADB_CMD shell pm disable-user --user 0 com.amazon.tv.forcedotaupdater.v2 2>/dev/null || true
+    fi
 fi
 echo -e "${GREEN}Auto-update protections applied!${NC}"
 echo ""
@@ -364,38 +632,164 @@ else
     echo -e "${RED}✗ Moonode Launcher not found${NC}"
     exit 1
 fi
+echo ""
+
+# =============================================================================
+# Cache warm-up window.
+#
+# Moonode's offline mode is driven by the WebView Service Worker, which has
+# to register and populate Cache Storage with moonode.tv assets on first
+# online run. If the operator runs `adb reboot` (or just unplugs the TV)
+# before this finishes, the launcher boots offline next time with empty
+# Cache Storage and shows "offline content unavailable".
+#
+# This is the failure mode we hit on the TCL AT11 manual install. The fix:
+# kick Moonode on screen, then hold the script here for ~3 minutes so the
+# SW finishes installing assets into Cache Storage and IndexedDB.
+#
+# This is intentionally a passive wait instead of an active disk poll
+# because `dumpsys diskstats` output format varies across Android versions
+# and OEMs, and /data/data/com.moonode.launcher isn't readable from a
+# non-root adb shell. Operators wanting concrete proof can verify via
+# chrome://inspect (see TROUBLESHOOTING.md).
+# =============================================================================
+echo -e "${BLUE}Kicking Moonode on screen to start the Service Worker...${NC}"
+$ADB_CMD shell am start -n com.moonode.launcher/com.moonode.launcher.MainActivity >/dev/null 2>&1 || true
+sleep 5
+
+echo -e "${BLUE}Cache warm-up window: 3 minutes - DO NOT reboot the TV yet.${NC}"
+for s in 180 160 140 120 100 80 60 40 20; do
+    printf "\r  %3ds remaining (do not reboot)...  " "$s"
+    sleep 20
+done
+printf "\n"
+echo -e "${GREEN}Warm-up window complete. Offline reboot should now work.${NC}"
+echo ""
+
+# =============================================================================
+# Optional lockdown (--lockdown flag).
+#
+# Soft mode leaves the stock launcher enabled so the operator can recover
+# without ADB. Once Moonode has been verified on-screen and the cache is
+# warm, --lockdown disables the Google TV launcher packages so Moonode
+# actually wins the HOME intent.
+#
+# On Xiaomi, MIUI re-enables disabled system launchers on every reboot.
+# Pair lockdown with a BootReceiver build that retries launching Moonode
+# on boot (same strategy as Fire TV).
+# =============================================================================
+LOCKDOWN_APPLIED=0
+if [ "$LOCKDOWN_MODE" -eq 1 ] && [ "$IS_FIRETV" -eq 0 ]; then
+    echo -e "${BLUE}Lockdown: verifying Moonode is on screen before disabling stock launcher...${NC}"
+    FOCUS=$($ADB_CMD shell dumpsys window 2>/dev/null | grep mCurrentFocus | head -1 | tr -d '\r')
+    if echo "$FOCUS" | grep -q "com.moonode.launcher"; then
+        echo -e "${GREEN}Moonode is foreground - safe to lock down.${NC}"
+        for launcher in \
+            "com.google.android.tvlauncher" \
+            "com.google.android.apps.tv.launcherx" \
+            "com.google.android.leanbacklauncher" \
+            "com.google.android.tungsten.setupwraith"; do
+            if $ADB_CMD shell pm list packages | grep -q "$launcher"; then
+                echo "  Disabling $launcher..."
+                $ADB_CMD shell pm disable-user --user 0 "$launcher" 2>/dev/null || true
+            fi
+        done
+        $ADB_CMD shell input keyevent KEYCODE_HOME >/dev/null 2>&1 || true
+        sleep 2
+        if moonode_is_default_home; then
+            LOCKDOWN_APPLIED=1
+            echo -e "${GREEN}Lockdown applied - Moonode is now HOME.${NC}"
+            if [ "$IS_XIAOMI" -eq 1 ]; then
+                echo -e "${YELLOW}Xiaomi note: MIUI re-enables the stock launcher on reboot.${NC}"
+                echo -e "${YELLOW}Rebuild the APK (BootReceiver Xiaomi retries) for persistent boot behaviour.${NC}"
+            fi
+        else
+            echo -e "${RED}Lockdown failed - re-enabling stock launcher for safety.${NC}"
+            $ADB_CMD shell pm enable com.google.android.apps.tv.launcherx 2>/dev/null || true
+            $ADB_CMD shell pm enable com.google.android.tungsten.setupwraith 2>/dev/null || true
+            $ADB_CMD shell pm enable com.google.android.tvlauncher 2>/dev/null || true
+        fi
+    else
+        echo -e "${RED}Moonode is not on screen ($FOCUS) - skipping lockdown.${NC}"
+        echo "  Launch Moonode manually, then re-run with --lockdown."
+    fi
+    echo ""
+fi
 
 # Final instructions
-echo ""
 echo -e "${GREEN}=================================="
 echo -e "🎉 Setup Complete!"
 echo -e "==================================${NC}"
 echo ""
-echo "What's configured:"
+echo "What's configured ($DEVICE_KIND):"
 echo "  ✓ Moonode Launcher installed"
-echo "  ✓ Default launcher disabled"
-echo "  ✓ 'No Internet' warnings disabled"
-echo "  ✓ Screen always-on (AOSP sleep + Fire OS screensaver + Energy Saver)"
+echo "  ✓ Captive-portal probe disabled (Service Worker can register)"
+if [ "$IS_FIRETV" -eq 1 ]; then
+    echo "  ✓ Amazon launcher(s) disabled"
+    echo "  ✓ HOME Guardian enabled + self-healing (via WRITE_SECURE_SETTINGS)"
+    echo "  ✓ Fire OS Energy Saver / EcoMode neutralised"
+    echo "  ✓ Fire TV auto-updates suppressed (apps + forced OTAs)"
+else
+    echo "  ✓ Google Backdrop ambient-dream disabled (no black-screen-after-boot)"
+    if [ "$SOFT_MODE" -eq 1 ] && [ "$LOCKDOWN_APPLIED" -eq 0 ]; then
+        echo "  ✓ Soft mode: stock launcher LEFT ENABLED (recovery path preserved)"
+        if moonode_is_default_home 2>/dev/null || [ "$NEW_HOME" = "com.moonode.launcher" ]; then
+            echo "  ✓ Moonode is default HOME role (Xiaomi picker / role manager)"
+            echo "  ! Stock launcher still wins HOME button - re-run with --lockdown"
+        else
+            echo "  ! Stock launcher is still HOME - finish picker step on TV to switch"
+        fi
+    elif [ "$LOCKDOWN_APPLIED" -eq 1 ]; then
+        echo "  ✓ Lockdown applied: stock launcher disabled, Moonode is HOME"
+    elif [ "$SOFT_MODE" -eq 1 ]; then
+        echo "  ✓ Soft mode: stock launcher LEFT ENABLED (recovery path preserved)"
+    else
+        echo "  ✓ Moonode set as HOME activity"
+    fi
+    echo "  ✓ Screensaver / sleep / DayDream disabled"
+    echo "  ✓ App auto-update + automatic OTAs suppressed"
+fi
 echo "  ✓ Display overscan reset (full screen)"
-echo "  ✓ Fire TV auto-updates suppressed (apps + forced OTAs)"
-echo "  ✓ HOME Guardian enabled + self-healing (via WRITE_SECURE_SETTINGS grant)"
+echo "  ✓ Service Worker cache warmed (offline reboot ready)"
 echo ""
-echo -e "${YELLOW}If the screen still goes black after ~4 hours of inactivity:${NC}"
-echo "    Settings → Preferences → Power → Energy Saver → Off"
-echo "  (Some Fire OS builds gate this behind the on-screen UI only.)"
-echo ""
+
+if [ "$SOFT_MODE" -eq 1 ] && [ "$LOCKDOWN_APPLIED" -eq 0 ]; then
+    echo -e "${YELLOW}Recovery path (soft mode):${NC}"
+    echo "  If Moonode ever black-screens, press HOME on the remote - the system"
+    echo "  HOME picker will reappear and you can switch back to the stock"
+    echo "  launcher with no ADB needed. The stock launcher was NOT disabled."
+    if [ "$IS_XIAOMI" -eq 1 ]; then
+        echo ""
+        echo -e "${YELLOW}To make Moonode actually HOME on Xiaomi:${NC}"
+        echo "  1. Rebuild APK:  cd .. && flutter build apk --release"
+        echo "  2. Re-run setup: ./setup-moonode-launcher.sh --lockdown IP:5555"
+    fi
+    echo ""
+fi
+
+if [ "$IS_FIRETV" -eq 1 ]; then
+    echo -e "${YELLOW}If the screen still goes black after ~4 hours of inactivity:${NC}"
+    echo "    Settings → Preferences → Power → Energy Saver → Off"
+    echo "  (Some Fire OS builds gate this behind the on-screen UI only.)"
+    echo ""
+fi
+
 echo "Next steps:"
 echo "  1. Press the HOME button on your TV remote"
-echo "  2. If prompted, select 'Moonode Launcher'"
-echo "  3. Choose 'Always' to make it permanent"
-echo "  4. Connect to WiFi and let moonode.tv load (caches for offline)"
+if [ "$IS_FIRETV" -eq 1 ]; then
+    echo "  2. If prompted, select 'Moonode Launcher' and choose 'Always'"
+else
+    echo "  2. Moonode should already be HOME - no picker should appear"
+fi
+echo "  3. Let moonode.tv load fully at least once on WiFi (already done by"
+echo "     this script's warm-up window, but if you swap APKs do it again)"
 echo ""
 echo -e "${YELLOW}IMPORTANT: First load requires internet to cache content!${NC}"
 echo ""
-echo -e "${YELLOW}To restore original launcher:${NC}"
-echo "  adb shell pm enable com.google.android.apps.tv.launcherx"
-echo "  adb shell pm enable com.google.android.tungsten.setupwraith"
-echo "  adb shell settings put global captive_portal_mode 1"
+
+echo -e "${YELLOW}To restore the original launcher:${NC}"
+echo "  ./uninstall-moonode-launcher.sh"
+echo "  (or manually re-enable the stock launcher package, see TROUBLESHOOTING.md)"
 echo ""
 echo -e "${BLUE}🌙 Moonode - From Your Screen to Their Pocket${NC}"
 echo ""
