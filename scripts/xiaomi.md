@@ -310,6 +310,58 @@ sanity-check `dumpsys media.player` for the same `c2.amlogic.{avc,hevc,vp9}`
 HW decoders before committing to a deployment — older S905-family chips
 sometimes drop VP9 hardware support.
 
+### Audio-stripped video variants (the "freeze at 3 seconds" bug)
+
+Even though signage `<video>` elements set `muted` in HTML, **Chromium
+still decodes the audio track in the background**. Amlogic's software
+AAC decoder occasionally chokes on a single bad packet a few seconds in
+and Chromium fires `MEDIA_ERR_DECODE` (code 3); the picture freezes,
+even though the H.264/HEVC frames are decoding fine on the VPU. We
+reproduced this on overlay ads (3 s in, instead of the configured
+30 s) and it would have hit any signage `<video>` long enough to
+expose a defective audio packet.
+
+The launcher itself can't fix this — the decoder is in WebView. The
+fix lives across the stack:
+
+1. **Backend**, on every video upload: generate a sibling `*.muted.mp4`
+   file via `ffmpeg -an -c:v copy` (a 50–500 ms remux, no
+   re-encode). Stored in the same Linode bucket as the original.
+   See `backend/infrastructure/media/videoVariants.js`.
+2. **Schema**: `MediaLibrary.mutedUrl` carries the variant URL;
+   `BusinessScreen.overlayAds.media.mutedUrl` and
+   `BusinessScreen.layout.cards[].staticContent.mutedImage` carry the
+   embedded snapshot for the signage player. Both backends
+   (main and `backend-socket`) declare these fields — Mongoose strict
+   mode strips undeclared fields on the way out, so a missing
+   declaration would silently break the feature.
+3. **Player** (`frontend-player`): `OverlayAdvertising` and `VideoCard`
+   prefer `mutedUrl`/`mutedImage` and fall back to `url`/`image` when
+   absent. The `onError` gate (Path A) still keeps the overlay visible
+   for the configured duration if a legacy asset trips the decoder.
+
+**On the launcher side**: nothing to maintain. The launcher's WebView
+will simply receive a different `<video src=…>` for new uploads and
+play it without audio packets to choke on. Mobile uploads
+(`backend-media`) are unaffected — they keep the original audio track
+because the mobile app needs sound.
+
+### Diagnostic removed (v1.0.20)
+
+`MainActivity.logPersistenceFingerprint()` (a one-shot file walk +
+`SharedPreferences` dump on every `onCreate`/`onResume`, used while
+hunting the cache-persistence issue) has been removed. It ran on the
+main thread and contributed measurable lag to remote-key responsiveness
+on the Mi Box's quad-A55 SoC. If you ever need it again, restore from
+git history — but prefer ADB:
+
+```bash
+adb shell run-as com.moonode.launcher \
+    sh -c 'cat files/boot_counter; ls -la app_webview'
+```
+
+— same data, zero impact on the running launcher.
+
 ---
 
 ## Quick start
