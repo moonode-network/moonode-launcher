@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.UserHandle
 import android.provider.Settings
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.webkit.WebView
 import android.webkit.WebSettings
 import androidx.annotation.NonNull
@@ -49,12 +50,78 @@ class MainActivity : FlutterActivity() {
     val launcherAppsCallbacks = ArrayList<LauncherApps.Callback>()
     private var keyEventChannel: MethodChannel? = null
 
+    companion object {
+        // While the operator is in Android Settings (Wi-Fi, etc.) we suppress
+        // HOME intents and boot-race retries so Moonode doesn't yank them back.
+        @Volatile
+        private var homeNavigationPausedUntilMs: Long = 0L
+
+        fun pauseHomeNavigation(durationMs: Long) {
+            homeNavigationPausedUntilMs =
+                android.os.SystemClock.uptimeMillis() + durationMs
+            BootReceiver.cancelPendingRetries()
+        }
+
+        fun isHomeNavigationPaused(): Boolean {
+            return android.os.SystemClock.uptimeMillis() < homeNavigationPausedUntilMs
+        }
+    }
+
+    // Multi-tap BACK escape hatch.
+    //
+    // Xiaomi MiTV remotes ship with a tiny set of buttons (HOME, BACK, volume,
+    // mic, Netflix/YouTube hotkeys) - none of which map to KEYCODE_MENU /
+    // SETTINGS / F1 / F2. Without an escape sequence the operator is locked
+    // out of Android Settings the moment Moonode becomes HOME. We allow
+    // "press BACK 3 times within 3 seconds" as a hidden escape that opens
+    // Android Settings directly. 3 is the smallest count that still can't be
+    // hit accidentally: web-app BACK presses inside the WebView are usually
+    // single (1 to leave a sub-route) or paired (2 if the user double-taps),
+    // and the in-page navigation eats them before the activity sees them
+    // anyway, so a real triple-press in 3 seconds reliably means "operator
+    // wants out".
+    private val backPressTimestamps = mutableListOf<Long>()
+    private val backEscapeCount = 3
+    private val backEscapeWindowMs = 3_000L
+
+    private val isFireTvDevice: Boolean by lazy {
+        val mfr = (Build.MANUFACTURER ?: "").lowercase()
+        val brand = (Build.BRAND ?: "").lowercase()
+        val model = (Build.MODEL ?: "").lowercase()
+        mfr.contains("amazon") || brand.contains("amazon") || model.startsWith("aft")
+    }
+
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
-        
+
+        // Signage-mode display policy: keep the panel on as long as Moonode
+        // is the foreground activity. Android TV / MIUI for TV both honour
+        // the system "Sleep" timer for HDMI output (Xiaomi defaults to
+        // 30 min, some Sony / TCL builds to 4 h). For a signage device that
+        // means a black screen at the customer site at the worst possible
+        // time. FLAG_KEEP_SCREEN_ON tells WindowManager "as long as this
+        // window is in the foreground, suppress the display-off timer" —
+        // it does NOT hold a CPU wakelock and is the recommended approach
+        // for kiosk/signage apps. (Chromium's MediaSession-based wake only
+        // engages while a <video> is actively playing; that's not enough
+        // for a static image-only ad rotation.)
+        //
+        // We attach the flag to the activity's window so it's automatically
+        // released when the operator opens Settings (we should NOT prevent
+        // sleep when the user is not on Moonode), and re-attached on
+        // resume. addFlags is idempotent so calling it again is safe.
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         // Configure WebView defaults for offline caching (Service Workers, DOM Storage)
         configureWebViewDefaults()
+
+        // Promote the process to foreground-service priority so aggressive
+        // OEM task killers (Xiaomi MIUI in particular) leave us alone while
+        // the operator is in Settings. Without this, the WebView reloads
+        // from scratch on every return to the launcher.
+        LauncherKeepAliveService.start(this)
     }
+
     
     /**
      * Configure WebView defaults to enable offline caching like Chromium.
@@ -81,6 +148,11 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.hasCategory(CATEGORY_HOME)) {
+            if (isHomeNavigationPaused()) {
+                // Operator opened Settings — don't steal focus back to Moonode.
+                moveTaskToBack(true)
+                return
+            }
             keyEventChannel?.invokeMethod("goHome", null)
         }
     }
@@ -126,17 +198,70 @@ class MainActivity : FlutterActivity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (event.action == KeyEvent.ACTION_DOWN) {
-            val keyAction = when (event.keyCode) {
+            // Multi-tap BACK escape: 5 presses within 3 seconds opens Android
+            // Settings. Stripped-down remotes (Xiaomi MiTV) have no SETTINGS
+            // button so this is the only way for an operator at the device to
+            // recover from a Wi-Fi misconfiguration without ADB.
+            if (event.keyCode == KeyEvent.KEYCODE_BACK) {
+                val now = android.os.SystemClock.uptimeMillis()
+                backPressTimestamps.add(now)
+                while (backPressTimestamps.isNotEmpty() &&
+                    now - backPressTimestamps[0] > backEscapeWindowMs) {
+                    backPressTimestamps.removeAt(0)
+                }
+                if (backPressTimestamps.size >= backEscapeCount) {
+                    backPressTimestamps.clear()
+                    android.util.Log.i(
+                        "MoonodeLauncher",
+                        "3x BACK escape triggered - opening Android Settings"
+                    )
+                    keyEventChannel?.invokeMethod("openAndroidSettings", null)
+                    return true
+                }
+                // Let the BACK press through to the WebView for normal navigation.
+            }
+
+            // Universal settings-style buttons (every remote we ship to). These
+            // were already captured before the Xiaomi work and stay unchanged
+            // so existing Fire TV / TCL deployments keep their muscle memory.
+            val universalSettingsKey = when (event.keyCode) {
                 KeyEvent.KEYCODE_MENU,
                 KeyEvent.KEYCODE_F1,
                 KeyEvent.KEYCODE_SETTINGS,
                 KeyEvent.KEYCODE_BOOKMARK,
                 KeyEvent.KEYCODE_GUIDE -> "openSettings"
-
                 KeyEvent.KEYCODE_F2 -> "openAndroidSettings"
-
                 else -> null
             }
+
+            // Stripped-down-remote escape keys.
+            //
+            // The Xiaomi MiTV remote has no MENU / F1 / SETTINGS button, so we
+            // grab a wider set of keycodes (apps, mic, TV input, colour buttons)
+            // to give the operator a way into launcher settings without ADB.
+            //
+            // We DO NOT enable this on Fire TV: the Alexa Voice Remote sends
+            // VOICE_ASSIST when the operator long-presses the mic, and
+            // intercepting it here would silently break Alexa for any Fire TV
+            // customer that still uses voice commands. Fire TV deployments
+            // already have F2 (USB keyboard / on-screen IME) and the HOME
+            // Guardian pause flow, so they don't need the extra keycodes.
+            val xiaomiSettingsKey = if (!isFireTvDevice) {
+                when (event.keyCode) {
+                    KeyEvent.KEYCODE_APP_SWITCH,
+                    KeyEvent.KEYCODE_VOICE_ASSIST,
+                    KeyEvent.KEYCODE_ASSIST,
+                    KeyEvent.KEYCODE_TV_INPUT,
+                    KeyEvent.KEYCODE_TV,
+                    KeyEvent.KEYCODE_PROG_RED,
+                    KeyEvent.KEYCODE_PROG_GREEN,
+                    KeyEvent.KEYCODE_PROG_YELLOW,
+                    KeyEvent.KEYCODE_PROG_BLUE -> "openSettings"
+                    else -> null
+                }
+            } else null
+
+            val keyAction = universalSettingsKey ?: xiaomiSettingsKey
             if (keyAction != null) {
                 keyEventChannel?.invokeMethod(keyAction, null)
                 return true
@@ -287,9 +412,11 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun openSettings() = try {
-        // Pause hijack first so HomeHijackService doesn't bounce the user back
-        // when Settings briefly transitions through the Amazon launcher window.
+        // Pause hijack + boot retries so HomeHijackService / BootReceiver
+        // doesn't bounce the user back when Settings opens.
         HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        pauseHomeNavigation(DEFAULT_PAUSE_MS)
+        moveTaskToBack(true)
         startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         true
     } catch (e: Exception) {
@@ -304,6 +431,8 @@ class MainActivity : FlutterActivity() {
      */
     private fun openWifiSettings(): Boolean {
         HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        pauseHomeNavigation(DEFAULT_PAUSE_MS)
+        moveTaskToBack(true)
         // Try Wi-Fi settings first, then fall back to network settings, then
         // generic settings - Fire OS variants expose different actions.
         val candidates = listOf(
@@ -328,6 +457,8 @@ class MainActivity : FlutterActivity() {
 
     private fun openAppInfo(packageName: String) = try {
         HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        pauseHomeNavigation(DEFAULT_PAUSE_MS)
+        moveTaskToBack(true)
         Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
                 .setData(Uri.fromParts("package", packageName, null))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -370,6 +501,9 @@ class MainActivity : FlutterActivity() {
      *   - Last-resort fallback: open generic Android Settings.
      */
     private fun chooseDefaultLauncher(): Boolean {
+        HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        pauseHomeNavigation(DEFAULT_PAUSE_MS)
+        moveTaskToBack(true)
         // 1) Try the dedicated HOME settings screen (works on most Android TV builds).
         try {
             val homeSettings = Intent(Settings.ACTION_HOME_SETTINGS)
@@ -472,6 +606,8 @@ class MainActivity : FlutterActivity() {
         // The user is on their way to toggle our own service; the same
         // hijack-pause logic applies so we don't bounce them.
         HomeHijackService.pauseFor(DEFAULT_PAUSE_MS)
+        pauseHomeNavigation(DEFAULT_PAUSE_MS)
+        moveTaskToBack(true)
         val component = "$packageName/${HomeHijackService::class.java.name}"
         // Generic accessibility list - works on every Android/Fire OS build.
         return try {

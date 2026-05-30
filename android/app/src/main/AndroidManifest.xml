@@ -40,6 +40,20 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      FOREGROUND_SERVICE keeps the launcher process alive on aggressive OEM
+      killers (Xiaomi MIUI in particular). Without it, MIUI wipes the
+      Moonode process the moment the operator opens Settings, and the WebView
+      reloads from scratch on return. POST_NOTIFICATIONS is required on
+      Android 13+ to surface the silent keep-alive notification; we don't
+      block on it (the launcher works fine if denied), it just falls back
+      to non-foreground service priority.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Required on Android 14+ (targetSdk 34) when foregroundServiceType=specialUse. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     
     <!-- Media Permissions - Audio/Video autoplay -->
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -82,14 +96,28 @@
         android:largeHeap="true">
         
         <!-- Main Activity - HOME Launcher -->
+        <!--
+          NOTE on launcher activity flags:
+          - launchMode="singleTask": one MainActivity per task, HOME intent
+            routes to onNewIntent on the existing instance (no recreation).
+          - clearTaskOnLaunch was REMOVED: with singleTask there is only one
+            activity in the task, so it was a no-op for the back stack but
+            on some OEMs (Xiaomi MiTV) it caused the system to drop the
+            WebView's in-memory state on every HOME press, making the
+            launcher visibly "reload" even though the SW cache on disk
+            was intact. Removing it lets the WebView keep its render state
+            so cached content shows instantly.
+          - stateNotNeeded was REMOVED for the same reason: when the OS
+            briefly recreates the activity for config changes (most are
+            already in configChanges, but device-level events still slip
+            through), we want the WebView to be re-attached, not reset.
+        -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:exported="true"
             android:hardwareAccelerated="true"
             android:launchMode="singleTask"
-            android:clearTaskOnLaunch="true"
-            android:stateNotNeeded="true"
             android:screenOrientation="landscape"
             android:theme="@style/LaunchTheme"
             android:windowSoftInputMode="adjustResize">
@@ -133,6 +161,21 @@
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>
+
+        <!--
+          LauncherKeepAliveService: foreground service that keeps the
+          launcher process from being killed by aggressive OEM task
+          managers (notably Xiaomi MIUI). See class comment for details.
+        -->
+        <service
+            android:name=".LauncherKeepAliveService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="kiosk-display-keep-alive" />
+        </service>
 
         <!--
           HOME Hijack accessibility service (Fire TV only in practice).

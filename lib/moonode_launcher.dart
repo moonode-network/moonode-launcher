@@ -5,6 +5,8 @@
  * Main launcher widget - displays moonode.tv in fullscreen WebView
  */
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -40,6 +42,31 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
   String _appVersion = '';
   bool _isSettingsOpen = false;
 
+  // Human-readable status surfaced under the spinner during the
+  // pre-WebView wait (Wi-Fi association, initial connectivity probe, etc.).
+  // Updating this gives the operator visible proof the launcher is making
+  // progress instead of staring at a generic "loading…" screen, and gives
+  // us a free in-the-field diagnostic: a screenshot of the splash tells us
+  // exactly which phase we hung in.
+  String _loadingStatus = 'Starting up…';
+
+  void _setStatus(String s) {
+    if (!mounted) return;
+    if (_loadingStatus == s) return;
+    setState(() => _loadingStatus = s);
+  }
+
+  // Single, long-lived FocusNode for the KeyboardListener.
+  //
+  // Previous behaviour was `focusNode: FocusNode()..requestFocus()` inside
+  // build(), which allocated a brand-new FocusNode AND stole focus on every
+  // setState (loading toggle, error toggle, version-string update, app
+  // resume). Each FocusNode holds native input wiring; leaking one per
+  // rebuild also caused intermittent focus thrash where keyboard events
+  // briefly stopped routing to the new node mid-frame. Caching it here
+  // and disposing it in dispose() is the canonical Flutter pattern.
+  late final FocusNode _keyboardFocusNode;
+
   // Moonode TV URL - the main content
   static const String moonodeTvUrl = 'https://moonode.tv';
 
@@ -47,6 +74,18 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _keyboardFocusNode = FocusNode(debugLabel: 'MoonodeLauncher.keyboard');
+    // One-shot focus request after the first frame. We can't request focus
+    // here in initState because the FocusNode isn't attached to the tree
+    // yet; doing it in build() risks re-requesting focus on every rebuild
+    // (the previous black-screen regression). Scheduling it once via
+    // addPostFrameCallback gives the same UX as the old inline
+    // `..requestFocus()` without the leak or the rebuild loop.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _keyboardFocusNode.requestFocus();
+      }
+    });
     _loadAppVersion();
     _checkConnectivity();
     _initWebView();
@@ -57,6 +96,7 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _keyboardFocusNode.dispose();
     super.dispose();
   }
 
@@ -155,23 +195,14 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
                 _isLoading = true;
                 _hasError = false;
               });
+              _setStatus('Loading moonode.tv…');
             }
 
-            // Inject viewport fix + render-process-gone auto-recovery early.
-            //
-            // Background: Fire TV Stick (1st gen) has only ~921 MB total RAM.
-            // Chromium's sandboxed renderer for this WebView runs at ~265 MB
-            // and when the system runs out of memory the lowmemorykiller will
-            // kill it as `fore TOP`. The WebView restarts itself but lands
-            // back on the moonode.tv root URL, looking to the user like the
-            // launcher just rebooted.
-            //
-            // To make recovery invisible: we keep `moonode_last_screen` in
-            // localStorage (Service Worker survives the restart, so does its
-            // localStorage). On every page start, if we just landed on root
-            // BUT we have a recent screen-id stashed, jump straight to it
-            // with replace() so the splash doesn't show and history isn't
-            // polluted.
+            // Inject the viewport meta as early as possible so the page can
+            // never render at the wrong scale on TV panels. Auto-rejoin /
+            // deep-link recovery used to live here too, but it was removed
+            // — moonode.tv handles paired-screen redirects itself via
+            // localStorage["45%643D"] in pages/generic.
             _webViewController.runJavaScript('''
               (function(){
                 try {
@@ -181,31 +212,17 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
                   if (document.head) document.head.appendChild(meta);
                 } catch(_) {}
 
-                try {
-                  var path = window.location.pathname || '';
-                  var isRoot = path === '/' || path === '' || path === '/index.html';
-                  if (isRoot) {
-                    var raw = window.localStorage && window.localStorage.getItem('moonode_last_screen');
-                    if (raw) {
-                      var saved = JSON.parse(raw);
-                      var ageMs = Date.now() - (saved.savedAt || 0);
-                      // Only auto-rejoin if the stash is fresh (< 6h) so we
-                      // don't permanently pin a stale screen-id from days ago.
-                      if (saved.id && ageMs < 6 * 60 * 60 * 1000) {
-                        window.location.replace('/' + saved.id);
-                      }
-                    }
-                  } else {
-                    // We're on a real screen - persist it for next recovery.
-                    var id = path.replace(/^\\//, '').split(/[\\/?#]/)[0];
-                    if (id) {
-                      window.localStorage.setItem(
-                        'moonode_last_screen',
-                        JSON.stringify({ id: id, savedAt: Date.now() })
-                      );
-                    }
-                  }
-                } catch(_) {}
+                // Native-side deep-link auto-rejoin was REMOVED on purpose:
+                // moonode.tv already owns the unpaired -> paired redirect via
+                // the localStorage["45%643D"] -> window.location.replace path
+                // in pages/generic. Re-doing it here just hides what is
+                // happening on the web side (and, at one point, masked a real
+                // bug where the launcher stored only the first path segment
+                // and deep-linked to a non-existent route). Letting moonode.tv
+                // perform the redirect itself keeps Fire TV, Android TV and
+                // Xiaomi MiTV on the exact same flow and makes failures
+                // visible (you see the pairing digit flash, then the
+                // redirect) instead of silently swallowed by the launcher.
               })();
             ''');
           },
@@ -219,17 +236,23 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
               _errorMessage = '';
             });
             
-            // Save current URL for offline recovery + cold-start auto-recovery.
-            // The timestamp is used by `_resolveStartupUrl()` to decide whether
-            // a cached screen-id is still fresh enough to deep-link into when
-            // a brand-new process spawns (after a memory kill, reboot, etc).
+            // Diagnostic-only: record the last URL the WebView landed on so
+            // we can answer "what screen was this device on before the
+            // reboot/crash?" from logcat (see MoonodePersist fingerprint
+            // in MainActivity.kt). We do NOT use these values for any
+            // startup redirect — that decision belongs to moonode.tv.
             if (url.contains('/') && url != moonodeTvUrl) {
               final uri = Uri.parse(url);
               if (uri.pathSegments.isNotEmpty) {
-                widget.sharedPreferences.setString('cached_screen_id', uri.pathSegments.first);
+                final fullPath = uri.path + (uri.hasQuery ? '?${uri.query}' : '');
+                widget.sharedPreferences.setString('cached_screen_path', fullPath);
                 widget.sharedPreferences.setInt(
                   'cached_screen_id_at',
                   DateTime.now().millisecondsSinceEpoch,
+                );
+                widget.sharedPreferences.setString(
+                  'cached_screen_id',
+                  uri.pathSegments.first,
                 );
               }
             }
@@ -322,37 +345,100 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
       'Mozilla/5.0 (Linux; Android TV; Moonode Launcher) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     );
 
-    // Cold-start recovery: on Fire TV Stick (~921 MB RAM) the OS routinely
-    // kills our entire foreground process under memory pressure. When the
-    // system relaunches us via the HOME intent, we land here in a brand-new
-    // process. If we just blindly load `moonode.tv` root, the user sees a
-    // visible "reload" back to the home/splash. Instead, if we have a recent
-    // screen-id stashed from a prior session, jump straight to that URL.
-    //
-    // The 6h freshness window matches the JS-side localStorage check so the
-    // two recovery paths agree on what counts as "still relevant".
-    final initialUrl = _resolveStartupUrl();
-    _webViewController.loadRequest(Uri.parse(initialUrl));
+    // Defer the actual navigation until either (a) we've observed a real
+    // network connection, or (b) we've waited long enough that doing
+    // nothing would feel broken. See `_loadInitialUrlWhenReady()` for
+    // the full reasoning. The Flutter splash (logo + spinner) is already
+    // visible at this point, so the wait is invisible to the operator.
+    _loadInitialUrlWhenReady();
   }
 
-  /// Pick the URL to load on launcher start. Defaults to moonode.tv root, but
-  /// if a recent screen-id is cached we jump directly there to make process
-  /// kill recovery invisible to the user.
-  String _resolveStartupUrl() {
+  /// Wait briefly for Wi-Fi to associate before pointing the WebView at
+  /// `moonode.tv`. Falls back to loading anyway after a hard ceiling so a
+  /// truly offline device still gets the SW/cache flow.
+  ///
+  /// Why this exists
+  /// ---------------
+  /// Without the wait, the boot sequence is:
+  ///
+  ///   1. Activity onCreate -> WebView created -> loadRequest(moonode.tv)
+  ///   2. WebView fires the request *before* the Wi-Fi state machine has
+  ///      finished associating (very common on Xiaomi MiTV: the panel/SoC
+  ///      finishes booting in ~3 s; the Wi-Fi driver settles in ~5–8 s).
+  ///   3. axios.get() in pages/generic throws ECONNRESET / TIMEOUT.
+  ///   4. setDigits() catch block reads localStorage["45%643D"] and
+  ///      window.location.replace's to the *previously paired* screen.
+  ///
+  /// That is correct behaviour for an offline reboot (operator just wants
+  /// their signage back). It is *wrong* when the operator has revoked the
+  /// pairing on the dashboard: the device still flashes the old paired
+  /// screen because the offline fallback fires before the API ever gets
+  /// a chance to say "this code is no longer active". Operator can't
+  /// re-pair without manually clearing app data.
+  ///
+  /// With the wait:
+  ///
+  ///   - online at boot                       -> loads immediately, normal flow
+  ///   - online after Wi-Fi associates (~3 s) -> loads after Wi-Fi is up,
+  ///                                             API call succeeds, dashboard
+  ///                                             revocation is honoured
+  ///   - offline (true)                       -> loads after the cap, SW + the
+  ///                                             setDigits() catch path provide
+  ///                                             the cached redirect exactly as
+  ///                                             before
+  ///
+  /// The cap is intentionally generous (10 s). Most Wi-Fi stacks resolve
+  /// well under 5 s; the extra headroom protects against laggy MIUI builds
+  /// without making truly-offline boots feel broken.
+  Future<void> _loadInitialUrlWhenReady() async {
+    const maxWaitMs = 10000;
+    bool loaded = false;
+    StreamSubscription<List<ConnectivityResult>>? sub;
+
+    void doLoad(String reason) {
+      if (loaded || !mounted) return;
+      loaded = true;
+      sub?.cancel();
+      debugPrint('[MoonodeLauncher] initial load via $reason');
+      // Final pre-WebView status. Stays visible until pages/generic
+      // either redirects (cached or via API) or paints its own pairing
+      // UI; either way our onPageFinished hook clears _isLoading.
+      _setStatus(
+        reason == 'timeout'
+            ? 'Loading Moonode (offline mode)…'
+            : 'Loading Moonode…',
+      );
+      _webViewController.loadRequest(Uri.parse(moonodeTvUrl));
+    }
+
+    _setStatus('Checking network…');
+
+    // Belt-and-suspenders ceiling. If the connectivity plugin hangs, errors
+    // out, or never reports an online state (rare but seen in the wild on
+    // misconfigured Xiaomi Wi-Fi state machines), we still navigate the
+    // WebView so the operator never stares at the splash forever.
+    Future.delayed(const Duration(milliseconds: maxWaitMs),
+        () => doLoad('timeout'));
+
     try {
-      final cachedId = widget.sharedPreferences.getString('cached_screen_id');
-      final savedAtMs = widget.sharedPreferences.getInt('cached_screen_id_at') ?? 0;
-      if (cachedId != null && cachedId.isNotEmpty) {
-        final ageMs = DateTime.now().millisecondsSinceEpoch - savedAtMs;
-        // 6h freshness window - long enough to survive overnight standby,
-        // short enough that a stale screen-id doesn't pin a customer to an
-        // outdated playlist forever after they've moved the device.
-        if (savedAtMs > 0 && ageMs < 6 * 60 * 60 * 1000) {
-          return '$moonodeTvUrl/$cachedId';
-        }
+      final initial = await Connectivity().checkConnectivity();
+      final initiallyOnline =
+          initial.isNotEmpty && !initial.contains(ConnectivityResult.none);
+      if (initiallyOnline) {
+        doLoad('initial-online');
+        return;
       }
-    } catch (_) {}
-    return moonodeTvUrl;
+      _setStatus('Waiting for Wi-Fi…');
+      sub = Connectivity().onConnectivityChanged.listen((results) {
+        final online =
+            results.isNotEmpty && !results.contains(ConnectivityResult.none);
+        if (online) doLoad('connectivity-event');
+      });
+    } catch (e) {
+      // Connectivity plugin failure - don't gate the launcher on it.
+      debugPrint('[MoonodeLauncher] connectivity check failed: $e');
+      doLoad('connectivity-error');
+    }
   }
 
   void _openSettings() {
@@ -381,16 +467,12 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
       _hasError = false;
     });
     
-    // If offline, try loading cached screen directly
-    if (_isOffline) {
-      final cachedScreenId = widget.sharedPreferences.getString('cached_screen_id');
-      if (cachedScreenId != null && cachedScreenId.isNotEmpty) {
-        // Load the cached screen URL - Service Worker should serve from cache
-        _webViewController.loadRequest(Uri.parse('$moonodeTvUrl/$cachedScreenId'));
-        return;
-      }
-    }
-    
+    // Always retry against moonode.tv root and let the web app's own
+    // unpaired -> paired redirect logic take over. When offline,
+    // `setDigits()` in pages/generic catches the network error and
+    // window.location.replace's via the cached localStorage["45%643D"];
+    // when online and paired, it redirects via the API response. Either
+    // way the launcher does not need to second-guess the URL.
     _webViewController.loadRequest(Uri.parse(moonodeTvUrl));
   }
 
@@ -398,7 +480,7 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
   Widget build(BuildContext context) {
     return Scaffold(
       body: KeyboardListener(
-        focusNode: FocusNode()..requestFocus(),
+        focusNode: _keyboardFocusNode,
         onKeyEvent: (KeyEvent event) {
           if (event is KeyDownEvent) {
             // Open launcher settings on Menu/F1 button press
@@ -447,6 +529,25 @@ class _MoonodeLauncherState extends State<MoonodeLauncher> with WidgetsBindingOb
                           const SizedBox(height: 32),
                           const CircularProgressIndicator(
                             valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFF5D742)),
+                          ),
+                          const SizedBox(height: 20),
+                          // Phase status. Updated by _setStatus() during the
+                          // pre-WebView wait (Starting up / Checking network /
+                          // Waiting for Wi-Fi / Loading Moonode), then by the
+                          // WebView's onPageStarted hook ("Loading
+                          // moonode.tv…"). Animated so the change reads as
+                          // intentional progress instead of a flicker.
+                          AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 250),
+                            child: Text(
+                              _loadingStatus,
+                              key: ValueKey(_loadingStatus),
+                              style: const TextStyle(
+                                fontSize: 14,
+                                color: Colors.white60,
+                                letterSpacing: 1.2,
+                              ),
+                            ),
                           ),
                         ],
                       ),
